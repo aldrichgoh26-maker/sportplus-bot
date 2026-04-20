@@ -25,13 +25,16 @@ async function checkFeedAndPost() {
 
         if (newestArticle.link === lastPostedLink) {
             console.log('No new articles. All good.');
-            return false; // Tells the server no action was taken
+            return false;
         }
 
         console.log('🚨 NEW ARTICLE! Posting...');
         let summary = newestArticle.contentSnippet || "Click the link to read more.";
         if (summary.length > 200) summary = summary.substring(0, 200) + '...';
-        const caption = `📰 *${newestArticle.title}*\n\n📝 ${summary}\n\n🔗 [Read Full Article](${newestArticle.link})`;
+
+        // --- UPDATED CAPTION: BOTH LINKS ARE HERE ---
+        const caption = `📰 *${newestArticle.title}*\n\n📝 ${summary}\n\n🔗 [Read Full Article](${newestArticle.link})\n\n📢 *Join* [@SportPlusSGupdates](https://t.me/SportPlusSGupdates) *for more updates!*`;
+        
         const imageUrl = newestArticle.enclosure?.url || newestArticle['media:content']?.$?.url;
 
         if (imageUrl) {
@@ -42,7 +45,7 @@ async function checkFeedAndPost() {
 
         fs.writeFileSync(MEMORY_FILE, newestArticle.link);
         console.log('✅ Posted and saved!');
-        return true; // Tells the server we posted something
+        return true; 
     } catch (error) {
         console.error('Error checking feed:', error);
         return false;
@@ -51,16 +54,13 @@ async function checkFeedAndPost() {
 
 bot.launch();
 
-// --- WEB SERVER FOR RENDER & CRON ---
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Render uses this to check if the app is alive
 app.get('/', (req, res) => {
     res.send('Bot is awake!');
 });
 
-// The Cron Job will hit this URL every 10 minutes
 app.get('/run-bot', async (req, res) => {
     const posted = await checkFeedAndPost();
     if (posted) {
