@@ -56,11 +56,9 @@ async function checkFeedAndPost() {
             let summary = article.contentSnippet || "Click the link to read more.";
             if (summary.length > 200) summary = summary.substring(0, 200) + '...';
 
-            // Custom caption with summary, article link, and HUB join link
             const caption = `📰 *${article.title}*\n\n📝 ${summary}\n\n🔗 [Read Full Article](${article.link})\n\n📢 *Join the conversation in* [SportPlus THE HUB](https://t.me/SportPlusTHEHUB) *for more!*`;
             const imageUrl = article.enclosure?.url || article['media:content']?.$?.url;
 
-            // Target the specific Topic (Thread ID)
             const postOptions = { 
                 parse_mode: 'Markdown',
                 message_thread_id: THREAD_ID 
@@ -75,7 +73,7 @@ async function checkFeedAndPost() {
                 
                 savePostedLink(article.link);
                 console.log(`✅ Posted to News Topic: ${article.title}`);
-                await sleep(3000); // 3-second delay to avoid spam filters
+                await sleep(3000); 
 
             } catch (err) {
                 console.error(`❌ Failed to post ${article.title}:`, err);
@@ -89,6 +87,18 @@ async function checkFeedAndPost() {
         return false;
     }
 }
+
+// --- THE BOUNCER: KEEPS THE NEWS TOPIC READ-ONLY ---
+bot.on('message', async (ctx) => {
+    // If a human sends a message specifically in the News Topic, delete it instantly
+    if (ctx.message && ctx.message.message_thread_id == THREAD_ID) {
+        try {
+            await ctx.deleteMessage();
+        } catch (err) {
+            console.log('Could not delete message. Check if bot has Delete permission.');
+        }
+    }
+});
 
 bot.launch();
 
