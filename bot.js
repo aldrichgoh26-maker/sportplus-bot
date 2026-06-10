@@ -67,14 +67,23 @@ async function checkFeedAndPost() {
             };
 
             try {
+                // --- GHOST BYPASS STEP 1: UN-CLOSE TOPIC ---
+                // The .catch prevents the bot from crashing if the topic is already open
+                await bot.telegram.reopenForumTopic(CHAT_ID, THREAD_ID).catch(() => {});
+
+                // --- GHOST BYPASS STEP 2: DROP THE ARTICLE ---
                 if (imageUrl) {
                     await bot.telegram.sendPhoto(CHAT_ID, imageUrl, { caption: caption, ...postOptions });
                 } else {
                     await bot.telegram.sendMessage(CHAT_ID, caption, postOptions);
                 }
                 
+                // --- GHOST BYPASS STEP 3: RE-CLOSE TOPIC ---
+                await bot.telegram.closeForumTopic(CHAT_ID, THREAD_ID).catch(() => {});
+
                 savePostedLink(article.link);
-                console.log(`✅ Posted to News Topic: ${article.title}`);
+                console.log(`✅ Posted to News Topic & Re-Closed: ${article.title}`);
+                
                 await sleep(3000); // 3-second delay to avoid spam filters
 
             } catch (err) {
