@@ -105,7 +105,20 @@ async function checkFeedAndPost() {
 
             try {
                 if (imageUrl) {
-                    await bot.telegram.sendPhoto(CHAT_ID, imageUrl, { caption: caption, ...postOptions });
+                    // Telegram fetches the image itself, so a URL that 404s, redirects to HTML
+                    // or blows the size limit fails the whole article -- for a reason that has
+                    // nothing to do with the text. Post the text instead of losing the item.
+                    try {
+                        await bot.telegram.sendPhoto(CHAT_ID, imageUrl, { caption: caption, ...postOptions });
+                    } catch (photoErr) {
+                        // Only a 400 means Telegram rejected the IMAGE. A timeout or 5xx may
+                        // have delivered the photo already, so retrying those would double-post.
+                        const code = photoErr?.response?.error_code ?? photoErr?.code;
+                        if (code !== 400) throw photoErr;
+                        const why = photoErr?.response?.description || photoErr?.message;
+                        console.warn(`🖼️ Image rejected (${why}) — posting text only: ${article.title}`);
+                        await bot.telegram.sendMessage(CHAT_ID, caption, postOptions);
+                    }
                 } else {
                     await bot.telegram.sendMessage(CHAT_ID, caption, postOptions);
                 }
