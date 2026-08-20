@@ -154,7 +154,48 @@ bot.on('message', async (ctx) => {
     }
 });
 
-bot.launch();
+// Long polling exists ONLY for the bouncer above. It must never take the process
+// down with it: /run-bot is what the scheduler calls, and an instance that dies
+// here answers 503 to every tick until it restarts. An unhandled rejection from
+// launch() did exactly that -- 26 consecutive 503s over two hours got the whole
+// schedule disabled, and the feed went quiet for a week.
+//
+// telegraf retries 429s and 5xx inside the polling loop; only 401 and 409 escape.
+// A 409 means another container currently holds getUpdates, which is normal for a
+// few seconds either side of a deploy, so it is worth waiting out. A 401 is a bad
+// token and will never fix itself, so stop rather than spam. Each launch() builds
+// a fresh Polling instance, so retrying is safe.
+const POLL_BACKOFF_MS = [5000, 15000, 45000, 120000];
+
+async function startBouncer(attempt = 0) {
+    const startedAt = Date.now();
+    try {
+        await bot.launch();   // resolves only once polling stops
+        console.log('Long polling ended.');
+        return;
+    } catch (err) {
+        const code = err?.response?.error_code ?? err?.code;
+        const why = err?.response?.description || err?.message;
+
+        if (code === 401) {
+            console.error(`⚠️ Polling stopped: ${why} — check BOT_TOKEN. Posting is unaffected.`);
+            return;
+        }
+        // A long healthy run earns a fresh retry budget, so unrelated failures
+        // months apart don't accumulate into a permanent give-up.
+        const next = Date.now() - startedAt > 60000 ? 0 : attempt;
+        const wait = POLL_BACKOFF_MS[next];
+        if (wait === undefined) {
+            console.error(`⚠️ Polling gave up after ${POLL_BACKOFF_MS.length} attempts: ${why}. The bouncer is off; posting is unaffected.`);
+            return;
+        }
+        console.warn(`⚠️ Polling failed (${why}) — retrying in ${wait / 1000}s. Posting is unaffected.`);
+        await sleep(wait);
+        return startBouncer(next + 1);
+    }
+}
+
+startBouncer();
 
 const app = express();
 const PORT = process.env.PORT || 3000;

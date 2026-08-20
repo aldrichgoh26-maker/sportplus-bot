@@ -36,12 +36,25 @@ function apiError(code, description) {
     return e;
 }
 
+// The first launch() rejects with the 409 that used to kill the process; the retry
+// then holds the poll open, the way a healthy bot does once the other container
+// has gone. Lets us assert both survival and recovery.
+let launchCalls = 0;
+
 Module._load = function (request) {
     if (request === 'telegraf') {
         return {
             Telegraf: class {
                 constructor() { this.telegram = fakeTelegram; }
-                on() {} launch() {} stop() {}
+                on() {}
+                stop() {}
+                launch() {
+                    if (++launchCalls === 1) {
+                        return Promise.reject(apiError(409,
+                            'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running'));
+                    }
+                    return new Promise(() => {});   // healthy: polls until stopped
+                }
             },
         };
     }
@@ -137,6 +150,19 @@ const CASES = [
     await new Promise((r) => setTimeout(r, 400)); // let app.listen bind
 
     let failed = 0;
+
+    // A rejected launch() must not take the HTTP route down with it. If the process
+    // had died on that 409 this request would not connect at all -- which is exactly
+    // how the scheduler saw 503 on every tick and switched itself off.
+    {
+        photoError = apiError(400, 'Bad Request: failed to get HTTP URL content');
+        const { result } = await quietly(() => runBot(port).catch((e) => ({ status: 'NO CONNECTION: ' + e.code })));
+        const ok = result.status === 200;
+        if (!ok) failed++;
+        console.log(`${ok ? '  PASS' : '  FAIL'}  polling died (409) -> process survives, /run-bot still serves`);
+        console.log(`        HTTP ${result.status}`);
+        fs.rmSync(path.join(tmp, 'posted_links.json'), { force: true });
+    }
     for (const c of CASES) {
         calls = [];
         photoError = c.error;
@@ -159,7 +185,16 @@ const CASES = [
         }
     }
 
+    // ...and it must come BACK, or the bouncer is silently dead until a redeploy.
+    // First backoff is 5s, so wait for it rather than racing it.
+    const deadline = Date.now() + 20000;
+    while (launchCalls < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));
+    const retried = launchCalls >= 2;
+    if (!retried) failed++;
+    console.log(`${retried ? '  PASS' : '  FAIL'}  polling is retried after the 409 (launch calls: ${launchCalls})`);
+
+    const total = CASES.length + 2;
     fs.rmSync(tmp, { recursive: true, force: true });
-    console.log(failed ? `\n${failed} of ${CASES.length} FAILED` : `\nall ${CASES.length} passed`);
+    console.log(failed ? `\n${failed} of ${total} FAILED` : `\nall ${total} passed`);
     process.exit(failed ? 1 : 0);
 })();
