@@ -40,6 +40,24 @@ const fakeTelegram = {
         sends.push({ kind: 'photo', chat: String(chat), photo, opts });
         return { message_id: ++msgId };
     },
+    sendVideo: async (chat, file, opts = {}) => {
+        sends.push({ kind: 'video', chat: String(chat), file, opts });
+        return { message_id: ++msgId };
+    },
+    sendAnimation: async (chat, file, opts = {}) => {
+        sends.push({ kind: 'animation', chat: String(chat), file, opts });
+        return { message_id: ++msgId };
+    },
+    sendDocument: async (chat, file, opts = {}) => {
+        sends.push({ kind: 'document', chat: String(chat), file, opts });
+        return { message_id: ++msgId };
+    },
+    // The real one answers an ARRAY, one message per item. The message link depends
+    // on that, so the stub has to model it rather than return a bare object.
+    sendMediaGroup: async (chat, media, opts = {}) => {
+        sends.push({ kind: 'album', chat: String(chat), media, opts });
+        return media.map(() => ({ message_id: ++msgId }));
+    },
     getChatAdministrators: async () => {
         if (adminsError) throw adminsError;
         return [{ user: { id: OWNER } }, { user: { id: SECOND_ADMIN } }];
@@ -115,6 +133,7 @@ function loadBot(env = {}) {
         PORT: '0',
         BROADCAST_TOPICS: 'General:0,News:286',
         BROADCAST_ADMIN_IDS: '',
+        BROADCAST_ALBUM_SETTLE_MS: '40',   // real value is 1500; no reason to sleep it
         ...env,
     });
     require(BOT);
@@ -137,6 +156,20 @@ const groupMsg = (from, text, thread) => ({
         from: { id: from },
     },
 });
+// `fields` is the raw Telegram payload shape, e.g. { video: { file_id } } or, for a
+// GIF, BOTH { animation, document } -- which is exactly how Telegram sends one.
+const dmMedia = (from, fields, caption, entities, groupId) => ({
+    message: {
+        message_id: ++msgId, caption, caption_entities: entities,
+        media_group_id: groupId,
+        chat: { id: from, type: 'private' },
+        from: { id: from },
+        ...fields,
+    },
+});
+const photoField = (n) => ({ photo: [{ file_id: `${n}-small` }, { file_id: `${n}-big` }] });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const tap = (from, data) => ({
     callback_query: {
         id: 'cb' + ++msgId, data, from: { id: from },
@@ -146,11 +179,19 @@ const tap = (from, data) => ({
 
 function reset() { sends = []; replies = []; answers = []; deletions = []; adminsError = null; replyError = null; }
 const toGroup = () => sends.filter((s) => s.chat === GROUP);
-const preview = () => sends.find((s) => s.chat !== GROUP);
+const toDm = () => sends.filter((s) => s.chat !== GROUP);
+const preview = () => toDm()[0];
 // The confirm button carries the draft id, so this is also the proof a draft exists.
+// It is searched across every DM send because an album's buttons CANNOT ride on the
+// media group -- sendMediaGroup takes no reply_markup -- so they arrive on a second
+// message underneath it.
 const buttonFor = (name) => {
-    const rows = preview()?.opts?.reply_markup?.inline_keyboard || [];
-    return rows.flat().find((b) => b.text.includes(name))?.callback_data;
+    for (const s of toDm()) {
+        const rows = s?.opts?.reply_markup?.inline_keyboard || [];
+        const hit = rows.flat().find((b) => b.text.includes(name));
+        if (hit) return hit.callback_data;
+    }
+    return undefined;
 };
 
 // --- cases -----------------------------------------------------------------
@@ -266,7 +307,111 @@ function check(name, ok, detail) {
         toGroup().length === 0 && !preview(),
         `group sends=${toGroup().length}`);
 
-    // 9. A broadcast that lands but whose receipt DM does not must never be reported
+    // 9. A video rides the same preview/confirm path, caption and all.
+    reset();
+    await bot.dispatch(dmMedia(OWNER, { video: { file_id: 'vid-1' } }, 'Race recap', [
+        { type: 'bold', offset: 0, length: 4 },
+    ]));
+    {
+        const data = buttonFor('General');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const g = toGroup()[0];
+        check('video -> sendVideo with caption and entities intact',
+            toGroup().length === 1 && g?.kind === 'video' && g?.file === 'vid-1'
+            && g?.opts.caption === 'Race recap'
+            && JSON.stringify(g?.opts.caption_entities) === JSON.stringify([{ type: 'bold', offset: 0, length: 4 }]),
+            `kind=${g?.kind} file=${g?.file} caption=${JSON.stringify(g?.opts?.caption)}`);
+    }
+
+    // 10. THE TRAP: Telegram sends a GIF with BOTH `animation` and `document` set.
+    //     Check document first and every GIF silently broadcasts as a file attachment.
+    reset();
+    await bot.dispatch(dmMedia(OWNER, {
+        animation: { file_id: 'gif-1' },
+        document: { file_id: 'gif-1-as-doc' },
+    }, 'nice'));
+    {
+        const data = buttonFor('General');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const g = toGroup()[0];
+        check('GIF -> sendAnimation, NOT sendDocument',
+            toGroup().length === 1 && g?.kind === 'animation' && g?.file === 'gif-1',
+            `kind=${g?.kind} file=${g?.file}`);
+    }
+
+    // 11. An album is N updates sharing a media_group_id. It must collapse to ONE
+    //     draft and ONE post -- three taps and three posts would be the bug.
+    reset();
+    await bot.dispatch(dmMedia(OWNER, photoField('a'), 'Meet recap', [{ type: 'bold', offset: 0, length: 4 }], 'grp-1'));
+    await bot.dispatch(dmMedia(OWNER, photoField('b'), undefined, undefined, 'grp-1'));
+    await bot.dispatch(dmMedia(OWNER, { video: { file_id: 'c-vid' } }, undefined, undefined, 'grp-1'));
+    await sleep(150);
+    {
+        const previews = toDm().filter((s) => s.kind === 'album');
+        const oneDraft = previews.length === 1 && previews[0].media.length === 3;
+        const data = buttonFor('General');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const g = toGroup();
+        const payload = g[0]?.media || [];
+        const captionOnFirstOnly = payload[0]?.caption === 'Meet recap'
+            && payload.slice(1).every((m) => m.caption === undefined);
+        check('album of 3 -> one draft, one sendMediaGroup, caption on item 0 only',
+            oneDraft && g.length === 1 && g[0].kind === 'album' && payload.length === 3
+            && captionOnFirstOnly && payload[2].type === 'video',
+            `previews=${previews.length} groupSends=${g.length} items=${payload.length} types=${payload.map((m) => m.type).join(',')}`);
+    }
+
+    // 12. Updates are not guaranteed ordered, and the order here is the order the
+    //     group sees, so it is sorted rather than trusted.
+    reset();
+    {
+        const first = dmMedia(OWNER, photoField('x'), 'first', undefined, 'grp-2');
+        const second = dmMedia(OWNER, photoField('y'), undefined, undefined, 'grp-2');
+        await bot.dispatch(second);            // arrives out of order
+        await bot.dispatch(first);
+        await sleep(150);
+        const data = buttonFor('General');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const payload = toGroup()[0]?.media || [];
+        check('album items are sorted by message_id, not arrival order',
+            payload.length === 2 && payload[0].media === 'x-big' && payload[1].media === 'y-big',
+            `order=${payload.map((m) => m.media).join(',')}`);
+    }
+
+    // 13. sendMediaGroup rejects animations and refuses to mix documents with photos.
+    //     Catching it here beats a 400 at confirm time, after the admin has been shown
+    //     a preview and told it was ready.
+    reset();
+    await bot.dispatch(dmMedia(OWNER, photoField('p'), 'x', undefined, 'grp-3'));
+    await bot.dispatch(dmMedia(OWNER, { animation: { file_id: 'g' }, document: { file_id: 'gd' } }, undefined, undefined, 'grp-3'));
+    await sleep(150);
+    const gifAlbumRefused = toGroup().length === 0 && !buttonFor('General')
+        && replies.concat(toDm().map((s) => s.text || '')).some((t) => /GIFs cannot go in an album/i.test(t || ''));
+
+    reset();
+    await bot.dispatch(dmMedia(OWNER, photoField('q'), 'x', undefined, 'grp-4'));
+    await bot.dispatch(dmMedia(OWNER, { document: { file_id: 'file-1' } }, undefined, undefined, 'grp-4'));
+    await sleep(150);
+    const mixedRefused = toGroup().length === 0 && !buttonFor('General')
+        && toDm().some((s) => /cannot be mixed/i.test(s.text || ''));
+
+    check('albums Telegram would reject are refused up front, with the reason',
+        gifAlbumRefused && mixedRefused,
+        `gifInAlbum=${gifAlbumRefused} docMixedWithPhoto=${mixedRefused}`);
+
+    // 14. A round video reads as "a video" to whoever sent it, but Telegram gives it
+    //     no caption field at all, so it needs its own explanation rather than silence.
+    reset();
+    await bot.dispatch(dmMedia(OWNER, { video_note: { file_id: 'round-1' } }));
+    check('round video -> explained, not silently dropped',
+        toGroup().length === 0 && !preview() && replies.some((r) => /Round videos carry no caption/i.test(r)),
+        `sends=${toGroup().length} reply="${replies[0] ?? ''}"`);
+
+    // 15. A broadcast that lands but whose receipt DM does not must never be reported
     //    as a failure. Found by driving the real telegraf composer: the receipt used
     //    to sit inside the try that guards the send, so a failed DM produced
     //    "Not sent -- tap again to retry" for a post the group had already seen.

@@ -87,6 +87,61 @@ function stripLeadingPost(text, entities) {
     return { text: raw.slice(cut), entities: shifted };
 }
 
+// ---------------------------------------------------------------------------
+// Media
+// ---------------------------------------------------------------------------
+
+// Nothing is ever downloaded or re-uploaded. An admin's own client does the upload
+// once, into the DM, and Telegram hands us a file_id; broadcasting re-sends that id.
+// So a 300 MB reel costs this process nothing but a JSON round trip, and the bot's
+// own 50 MB upload ceiling never comes into it.
+//
+// ORDER MATTERS. A GIF arrives with BOTH `animation` and `document` populated, so
+// animation has to be tested first or every GIF goes out as a silent file
+// attachment. Photo is first only because it is the common case.
+const MEDIA_KINDS = [
+    { field: 'photo', type: 'photo', send: 'sendPhoto', id: (v) => v[v.length - 1].file_id },
+    { field: 'animation', type: 'animation', send: 'sendAnimation', id: (v) => v.file_id },
+    { field: 'video', type: 'video', send: 'sendVideo', id: (v) => v.file_id },
+    { field: 'document', type: 'document', send: 'sendDocument', id: (v) => v.file_id },
+];
+
+function readMedia(msg) {
+    for (const k of MEDIA_KINDS) {
+        const v = msg[k.field];
+        if (v) return { type: k.type, send: k.send, fileId: k.id(v) };
+    }
+    return null;
+}
+
+// sendMediaGroup accepts photo, video, audio and document -- NOT animation -- and
+// refuses to mix documents with anything else. Rejecting up front with a specific
+// reason beats letting Telegram 400 the whole album at confirm time, when the admin
+// has already been shown a preview and told it was ready to go.
+function albumProblem(items) {
+    const kinds = new Set(items.map((i) => i.media.type));
+    if (kinds.has('animation')) return 'GIFs cannot go in an album -- send it on its own.';
+    if (kinds.has('document') && kinds.size > 1) return 'Files cannot be mixed with photos or videos in one album.';
+    if (items.length > 10) return 'Telegram caps an album at 10 items.';
+    return null;
+}
+
+// An album shows ONE caption, taken from whichever item carries it. Putting it on
+// index 0 is what makes the text appear under the group as a whole rather than
+// buried on the third clip.
+function albumPayload(draft) {
+    return draft.media.map((m, i) => ({
+        type: m.type,
+        media: m.fileId,
+        ...(i === 0 && draft.text
+            ? {
+                caption: draft.text,
+                caption_entities: draft.entities.length ? draft.entities : undefined,
+            }
+            : {}),
+    }));
+}
+
 // t.me/c/<id> links work for members of a private-by-id supergroup, which every
 // admin is. The -100 prefix is a Bot API artefact and is not part of the link.
 function messageLink(chatId, threadId, messageId) {
@@ -177,8 +232,11 @@ function makeDraftStore({ now = Date.now } = {}) {
 // ---------------------------------------------------------------------------
 
 const HELP = [
-    'Send me the message you want to put in the group -- text, or a photo with a caption.',
-    'I will show it back to you with a button for each topic. Nothing is posted until you tap one.',
+    'Send me what you want to put in the group. I will show it back to you with a button',
+    'for each topic -- nothing is posted until you tap one.',
+    '',
+    'Works with: text, photos, videos, GIFs, files, and albums (several photos or videos',
+    'sent together). Add a caption and it rides along.',
     '',
     'Formatting you apply here (bold, italics, links) is carried through exactly.',
     '',
@@ -186,6 +244,16 @@ const HELP = [
     '/cancel -- drop your most recent draft',
     '/help -- this message',
 ].join('\n');
+
+// Telegram splits an album into one update PER ITEM, all sharing a media_group_id,
+// delivered back to back. There is no "album finished" signal, so the only way to
+// know we have them all is to wait for the arrivals to stop. Everything buffered
+// under one id becomes a single draft with a single confirm button -- otherwise a
+// three-clip album would ask the admin to tap three times and post three times.
+// Configurable only so the test suite does not have to sleep through it for real.
+// Raising it in production would make the bot feel slow to answer; lowering it risks
+// splitting a slow album into two drafts.
+const ALBUM_SETTLE_MS = Number(process.env.BROADCAST_ALBUM_SETTLE_MS || 1500);
 
 function registerBroadcast(bot, opts) {
     const {
@@ -238,6 +306,67 @@ function registerBroadcast(bot, opts) {
         await ctx.reply('Draft dropped.');
     });
 
+    const albums = new Map();   // media_group_id -> { items, from, chatId, timer }
+
+    // The preview IS the message: same text, same entities, same file ids. There is
+    // no second rendering path that could differ from what the group will see.
+    async function showPreview(chatId, draft) {
+        const id = drafts.put(draft);
+        const markup = keyboardFor(id);
+        try {
+            if (draft.media.length > 1) {
+                // sendMediaGroup takes no reply_markup -- an album physically cannot
+                // carry buttons -- so the confirm has to be its own message underneath.
+                await telegram.sendMediaGroup(chatId, albumPayload(draft));
+                await telegram.sendMessage(chatId, `☝️ ${draft.media.length} items. Send this album to:`, { reply_markup: markup });
+            } else if (draft.media.length === 1) {
+                const m = draft.media[0];
+                await telegram[m.send](chatId, m.fileId, {
+                    caption: draft.text || undefined,
+                    caption_entities: draft.text && draft.entities.length ? draft.entities : undefined,
+                    reply_markup: markup,
+                });
+            } else {
+                await telegram.sendMessage(chatId, draft.text, {
+                    entities: draft.entities.length ? draft.entities : undefined,
+                    reply_markup: markup,
+                });
+            }
+        } catch (err) {
+            drafts.delete(id);
+            const why = err?.response?.description || err?.message;
+            console.error('❌ Could not show the broadcast preview:', why);
+            await telegram.sendMessage(chatId, `Could not build a preview: ${why}`).catch(() => {});
+        }
+    }
+
+    async function flushAlbum(groupId) {
+        const pending = albums.get(groupId);
+        if (!pending) return;
+        albums.delete(groupId);
+
+        // Telegram usually delivers in order, but the contract is per-update, not
+        // per-album, so sort rather than trust it -- the order here is the order the
+        // group sees.
+        pending.items.sort((a, b) => a.messageId - b.messageId);
+
+        const problem = albumProblem(pending.items);
+        if (problem) {
+            await telegram.sendMessage(pending.chatId, `Cannot send that album: ${problem}`).catch(() => {});
+            return;
+        }
+
+        // Clients attach the caption to whichever item the user typed it on, which is
+        // normally the first -- take the first one that actually carries text.
+        const captioned = pending.items.find((i) => i.text && i.text.trim());
+        await showPreview(pending.chatId, {
+            from: pending.from,
+            text: captioned ? captioned.text : '',
+            entities: captioned ? captioned.entities : [],
+            media: pending.items.map((i) => i.media),
+        });
+    }
+
     // Drafting happens ONLY in private chats. Doing it in the group would mean the
     // half-written version is already public, which defeats the point of a preview.
     bot.on('message', async (ctx) => {
@@ -251,56 +380,59 @@ function registerBroadcast(bot, opts) {
         }
 
         const msg = ctx.message || {};
-        const photo = Array.isArray(msg.photo) && msg.photo.length
-            ? msg.photo[msg.photo.length - 1].file_id   // last entry is the largest
-            : null;
+        const media = readMedia(msg);
 
-        const source = photo ? msg.caption : msg.text;
-        if (source == null) {
-            await ctx.reply('Text and photos only for now. A photo needs a caption.');
+        const source = media ? msg.caption : msg.text;
+        if (media == null && source == null) {
+            // Named explicitly: a round video reads as "a video" to the person who
+            // sent it, and Telegram gives it no caption field at all, so a silent
+            // "unsupported" would look like the bot dropping their announcement.
+            const why = msg.video_note ? 'Round videos carry no caption, so they cannot be a broadcast.'
+                : msg.voice || msg.audio ? 'Audio is not supported yet.'
+                    : 'I can send text, photos, videos, GIFs, files and albums.';
+            await ctx.reply(why);
             return;
         }
 
         const { text, entities } = stripLeadingPost(
-            source,
-            photo ? msg.caption_entities : msg.entities
+            source ?? '',
+            media ? msg.caption_entities : msg.entities
         );
 
         // An unrecognised command is a typo, not a broadcast. Drafting it would put
         // "/annonuce" in front of the confirm button and invite a tap.
-        if (!photo && text.startsWith('/')) {
+        if (!media && text.startsWith('/')) {
             await ctx.reply('Unknown command. /help for what I can do.');
             return;
         }
-        if (!text.trim()) {
+        if (!media && !text.trim()) {
             await ctx.reply('That is empty -- nothing to send.');
             return;
         }
 
-        const id = drafts.put({ from: ctx.from.id, text, entities, photo });
-        const markup = keyboardFor(id);
-
-        // The preview IS the message: same text, same entities, same photo. There is
-        // no second rendering path that could differ from what the group will see.
-        try {
-            if (photo) {
-                await telegram.sendPhoto(ctx.chat.id, photo, {
-                    caption: text,
-                    caption_entities: entities.length ? entities : undefined,
-                    reply_markup: markup,
-                });
-            } else {
-                await telegram.sendMessage(ctx.chat.id, text, {
-                    entities: entities.length ? entities : undefined,
-                    reply_markup: markup,
-                });
+        // One item of an album. Buffer it and restart the settle timer; the LAST
+        // arrival is the one that actually builds the draft.
+        if (media && msg.media_group_id) {
+            const gid = String(msg.media_group_id);
+            let pending = albums.get(gid);
+            if (!pending) {
+                pending = { items: [], from: ctx.from.id, chatId: ctx.chat.id, timer: null };
+                albums.set(gid, pending);
             }
-        } catch (err) {
-            drafts.delete(id);
-            const why = err?.response?.description || err?.message;
-            console.error('❌ Could not show the broadcast preview:', why);
-            await ctx.reply(`Could not build a preview: ${why}`);
+            pending.items.push({ messageId: msg.message_id, media, text, entities });
+            clearTimeout(pending.timer);
+            pending.timer = setTimeout(() => {
+                flushAlbum(gid).catch((err) => console.error('❌ Album preview failed:', err?.message));
+            }, ALBUM_SETTLE_MS);
+            return;
         }
+
+        await showPreview(ctx.chat.id, {
+            from: ctx.from.id,
+            text,
+            entities,
+            media: media ? [media] : [],
+        });
     });
 
     // A receipt that cannot be delivered still has to be loud somewhere, because the
@@ -348,16 +480,24 @@ function registerBroadcast(bot, opts) {
         let sent;
         try {
             const thread = target.threadId ?? undefined;
-            sent = draft.photo
-                ? await telegram.sendPhoto(chatId, draft.photo, {
-                    caption: draft.text,
-                    caption_entities: draft.entities.length ? draft.entities : undefined,
+            if (draft.media.length > 1) {
+                // sendMediaGroup answers with an ARRAY of messages, one per item.
+                // The first is what the message link should point at.
+                const group = await telegram.sendMediaGroup(chatId, albumPayload(draft), { message_thread_id: thread });
+                sent = Array.isArray(group) ? group[0] : group;
+            } else if (draft.media.length === 1) {
+                const m = draft.media[0];
+                sent = await telegram[m.send](chatId, m.fileId, {
+                    caption: draft.text || undefined,
+                    caption_entities: draft.text && draft.entities.length ? draft.entities : undefined,
                     message_thread_id: thread,
-                })
-                : await telegram.sendMessage(chatId, draft.text, {
+                });
+            } else {
+                sent = await telegram.sendMessage(chatId, draft.text, {
                     entities: draft.entities.length ? draft.entities : undefined,
                     message_thread_id: thread,
                 });
+            }
         } catch (err) {
             draft.sending = false;
             const why = err?.response?.description || err?.message;
@@ -388,4 +528,7 @@ module.exports = {
     messageLink,
     makeAdminGate,
     makeDraftStore,
+    readMedia,
+    albumProblem,
+    albumPayload,
 };
