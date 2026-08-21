@@ -18,6 +18,19 @@ const MEMORY_FILE = 'posted_links.json';
 // ever eligible, so the worst case is a couple of recent duplicates, not 20.
 const MAX_AGE_HOURS = Number(process.env.MAX_AGE_HOURS || 48);
 
+// Where the "chat about this" link lands. The NEWS topic is CLOSED, so a reader
+// cannot reply where they are standing -- this link is their only way to a topic
+// that accepts posts, and pointing it at the group root just dropped them on the
+// topic list they came from.
+//
+// It has to be a MESSAGE link. The discussion topic is General, and General has no
+// topic deep link: t.me/<group>/1 is not a topic address, it silently falls back to
+// the group page. A link to a message INSIDE General is the only way in, so this
+// points at the pinned welcome. If that message is ever deleted the URL degrades to
+// the group page -- exactly the behaviour it replaced -- so a stale id here can
+// never be worse than the bare group link, only less useful.
+const DISCUSS_URL = process.env.DISCUSS_URL || 'https://t.me/ATHLObySportPlus/316';
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Wix wraps titles in CDATA but still writes entities inside it, so an ampersand
@@ -95,7 +108,7 @@ async function checkFeedAndPost() {
             if (summary.length > 200) summary = summary.substring(0, 200) + '...';
             const title = decodeEntities(article.title);
 
-            const caption = `📰 <b>${escapeHtml(title)}</b>\n\n📝 ${escapeHtml(summary)}\n\n🔗 <a href="${escapeHtml(decodeEntities(article.link))}">Read Full Article</a>\n\n📢 <b>Join the conversation in</b> <a href="https://t.me/ATHLObySportPlus">SportPlus | ATHLO+</a> <b>for more!</b>`;
+            const caption = `📰 <b>${escapeHtml(title)}</b>\n\n📝 ${escapeHtml(summary)}\n\n🔗 <a href="${escapeHtml(decodeEntities(article.link))}">Read Full Article</a>\n\n💬 <b>Chat about this in</b> <a href="${DISCUSS_URL}">SportPlus | ATHLO+</a>`;
             const imageUrl = article.enclosure?.url || article['media:content']?.$?.url;
 
             const postOptions = {

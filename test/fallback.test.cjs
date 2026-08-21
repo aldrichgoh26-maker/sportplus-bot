@@ -25,10 +25,22 @@ const CHILD_MODE = !!process.env.BOT_TEST_CHILD;
 
 let calls = [];
 let photoError = null; // set per case, thrown by the sendPhoto stub
+// Every caption the bot tried to send, photo path and text path alike. The CTA link
+// used to be a literal in the template string with nothing asserting it, which is how
+// a dead t.me handle sat in every post for two months without anyone noticing.
+let captions = [];
 
 const fakeTelegram = {
-    sendPhoto: async () => { calls.push('sendPhoto'); throw photoError; },
-    sendMessage: async () => { calls.push('sendMessage'); return { message_id: 1 }; },
+    sendPhoto: async (_chat, _photo, opts) => {
+        calls.push('sendPhoto');
+        captions.push(opts?.caption ?? '');
+        throw photoError;
+    },
+    sendMessage: async (_chat, text) => {
+        calls.push('sendMessage');
+        captions.push(text ?? '');
+        return { message_id: 1 };
+    },
 };
 
 // Shaped like a telegraf TelegramError, which carries both .code and .response.
@@ -221,6 +233,10 @@ const CASES = [
         THREAD_ID: '286',
         MAX_AGE_HOURS: '7.5',
         PORT: String(port),
+        // A sentinel, not the real link: this asserts the caption carries whatever
+        // DISCUSS_URL is configured to be, so the wiring is what is under test and the
+        // production message id is not pinned into the harness.
+        DISCUSS_URL: 'https://t.me/EXAMPLE/999',
     });
 
     require(BOT);
@@ -242,6 +258,7 @@ const CASES = [
     }
     for (const c of CASES) {
         calls = [];
+        captions = [];
         photoError = c.error;
         fs.rmSync(path.join(tmp, 'posted_links.json'), { force: true });
 
@@ -262,6 +279,23 @@ const CASES = [
         }
     }
 
+    // The CTA has to ride BOTH paths. The photo caption and the text fallback are built
+    // from the same string today, but they are two separate sends, and a reader who only
+    // ever gets the fallback is exactly the reader who would be left with no way out of a
+    // closed NEWS topic.
+    {
+        calls = [];
+        captions = [];
+        photoError = apiError(400, 'Bad Request: failed to get HTTP URL content');
+        fs.rmSync(path.join(tmp, 'posted_links.json'), { force: true });
+        await quietly(() => runBot(port));
+        const carrying = captions.filter((c) => c.includes(process.env.DISCUSS_URL)).length;
+        const ok = captions.length === 2 && carrying === 2;
+        if (!ok) failed++;
+        console.log(`${ok ? '  PASS' : '  FAIL'}  the chat CTA rides both the photo caption and the text fallback`);
+        console.log(`        sends=${captions.length}  carrying DISCUSS_URL=${carrying}`);
+    }
+
     // ...and it must come BACK, or the bouncer is silently dead until a redeploy.
     // First backoff is 5s, so wait for it rather than racing it.
     const deadline = Date.now() + 20000;
@@ -278,7 +312,7 @@ const CASES = [
         if (!r.ok) console.log(r.log.split('\n').map((l) => '        | ' + l).join('\n'));
     }
 
-    const total = CASES.length + 3;
+    const total = CASES.length + 4;
     fs.rmSync(tmp, { recursive: true, force: true });
     console.log(failed ? `\n${failed} of ${total} FAILED` : `\nall ${total} passed`);
     process.exit(failed ? 1 : 0);
