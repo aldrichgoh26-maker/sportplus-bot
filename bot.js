@@ -30,7 +30,11 @@ const MAX_AGE_HOURS = Number(process.env.MAX_AGE_HOURS || 48);
 // points at the pinned welcome. If that message is ever deleted the URL degrades to
 // the group page -- exactly the behaviour it replaced -- so a stale id here can
 // never be worse than the bare group link, only less useful.
-const DISCUSS_URL = process.env.DISCUSS_URL || 'https://t.me/ATHLObySportPlus/316';
+// 316 was the pinned welcome until an admin wiped every message in the group on
+// 2026-08-21; 332 is the rebuilt one. A dead id here is not fatal -- the link
+// degrades to the group page, which is what it did before any of this -- but it
+// wastes the only CTA a reader gets, so it is worth keeping current.
+const DISCUSS_URL = process.env.DISCUSS_URL || 'https://t.me/ATHLObySportPlus/332';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -109,7 +113,12 @@ async function checkFeedAndPost() {
             if (summary.length > 200) summary = summary.substring(0, 200) + '...';
             const title = decodeEntities(article.title);
 
-            const caption = `📰 <b>${escapeHtml(title)}</b>\n\n📝 ${escapeHtml(summary)}\n\n🔗 <a href="${escapeHtml(decodeEntities(article.link))}">Read Full Article</a>\n\n💬 <b>Chat about this in</b> <a href="${DISCUSS_URL}">SportPlus | ATHLO+</a>`;
+            // "Chat about this" only spoke to people already in the group. These posts
+            // get forwarded out of it, and the group has a public username, so the link
+            // resolves for non-members too -- landing them on the pinned welcome, which
+            // is the house rules and an invitation to introduce themselves. Ask them to
+            // join rather than to reply.
+            const caption = `📰 <b>${escapeHtml(title)}</b>\n\n📝 ${escapeHtml(summary)}\n\n🔗 <a href="${escapeHtml(decodeEntities(article.link))}">Read Full Article</a>\n\n📲 <b>Be part of ATHLO+</b> — <a href="${DISCUSS_URL}">more news like this, plus races, gear and training partners</a>`;
             const imageUrl = article.enclosure?.url || article['media:content']?.$?.url;
 
             const postOptions = {
