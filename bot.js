@@ -154,7 +154,60 @@ bot.on('message', async (ctx) => {
     }
 });
 
-bot.launch();
+// Long polling exists ONLY for the bouncer above. It must never take the process
+// down with it: /run-bot is what the scheduler calls, and an instance that dies
+// here answers 503 to every tick until it restarts. An unhandled rejection from
+// launch() did exactly that -- 26 consecutive 503s over two hours got the whole
+// schedule disabled, and the feed went quiet for a week.
+//
+// telegraf retries 429s and 5xx inside the polling loop; only 401 and 409 escape.
+// A 409 means another container currently holds getUpdates, which is normal for a
+// few seconds either side of a deploy, so it is worth waiting out. A 401 is a bad
+// token and will never fix itself, so stop rather than spam. Each launch() builds
+// a fresh Polling instance, so retrying is safe.
+const POLL_BACKOFF_MS = [5000, 15000, 45000, 120000];
+
+async function startBouncer(attempt = 0) {
+    const startedAt = Date.now();
+    try {
+        await bot.launch();   // resolves only once polling stops
+        console.log('Long polling ended.');
+        return;
+    } catch (err) {
+        const code = err?.response?.error_code ?? err?.code;
+        const why = err?.response?.description || err?.message;
+
+        if (code === 401) {
+            console.error(`⚠️ Polling stopped: ${why} — check BOT_TOKEN. Posting is unaffected.`);
+            return;
+        }
+        // A long healthy run earns a fresh retry budget, so unrelated failures
+        // months apart don't accumulate into a permanent give-up.
+        const next = Date.now() - startedAt > 60000 ? 0 : attempt;
+        const wait = POLL_BACKOFF_MS[next];
+        if (wait === undefined) {
+            console.error(`⚠️ Polling gave up after ${POLL_BACKOFF_MS.length} attempts: ${why}. The bouncer is off; posting is unaffected.`);
+            return;
+        }
+        console.warn(`⚠️ Polling failed (${why}) — retrying in ${wait / 1000}s. Posting is unaffected.`);
+        await sleep(wait);
+        return startBouncer(next + 1);
+    }
+}
+
+// Last line of defence for the same invariant. Nothing in this process is worth more
+// than the HTTP route the scheduler depends on: a dead process answers 503 to every
+// tick, and enough consecutive 503s get the schedule switched off for good. Swallowing
+// these is normally bad practice -- it can hide a genuinely broken state -- but the
+// alternative here has already cost a week of silence twice, so log loudly and stay up.
+process.on('uncaughtException', (err) => {
+    console.error('⚠️ Uncaught exception — staying up so /run-bot keeps answering:', err);
+});
+process.on('unhandledRejection', (err) => {
+    console.error('⚠️ Unhandled rejection — staying up so /run-bot keeps answering:', err);
+});
+
+startBouncer();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -169,7 +222,35 @@ app.get('/run-bot', async (req, res) => {
     res.status(ok ? 200 : 500).json({ ok, ...result });
 });
 
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// Render sends SIGTERM to spin the free instance down every night, and how this
+// process answers decides whether it can be woken again in the morning.
+//
+// Two ways the old two-liner got that wrong. telegraf's stop() THROWS
+// "Bot is not running!" when polling never started or has already given up
+// (lib/telegraf.js: polling === undefined && webhookServer === undefined), and an
+// uncaught throw inside a signal handler exits non-zero. Even without the throw,
+// app.listen keeps the event loop alive, so the process never exits on its own and
+// waits to be killed. Either way Render records "Instance failed ... Exited with
+// status 1" instead of a clean spin-down.
+//
+// That matters because a service parked as FAILED is not the same as one parked as
+// asleep: on 2026-08-21 twenty consecutive scheduler ticks got an instant 503 with no
+// container ever booting, for 95 minutes, until a manual request forced a fresh boot.
+// A clean shutdown is exit code 0, whatever the bouncer happens to be doing.
+function shutdown(signal) {
+    try {
+        bot.stop(signal);
+    } catch (err) {
+        // Expected whenever the bouncer gave up or never started. Not a fault.
+        console.log(`Polling was not running at ${signal}: ${err.message}`);
+    }
+    server.close(() => process.exit(0));
+    // A held-open connection must not drag the shutdown past Render's grace period
+    // and turn a clean exit into a kill. unref so it never delays an early close.
+    setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));

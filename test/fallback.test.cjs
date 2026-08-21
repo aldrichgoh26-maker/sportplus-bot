@@ -20,6 +20,9 @@ const path = require('path');
 const origLoad = Module._load;
 const BOT = path.join(__dirname, '..', 'bot.js');
 
+// Set when this file re-enters itself as a child process; see sigtermExitsClean().
+const CHILD_MODE = !!process.env.BOT_TEST_CHILD;
+
 let calls = [];
 let photoError = null; // set per case, thrown by the sendPhoto stub
 
@@ -36,12 +39,37 @@ function apiError(code, description) {
     return e;
 }
 
+// The first launch() rejects with the 409 that used to kill the process; the retry
+// then holds the poll open, the way a healthy bot does once the other container
+// has gone. Lets us assert both survival and recovery.
+let launchCalls = 0;
+
 Module._load = function (request) {
     if (request === 'telegraf') {
         return {
             Telegraf: class {
-                constructor() { this.telegram = fakeTelegram; }
-                on() {} launch() {} stop() {}
+                constructor() { this.telegram = fakeTelegram; this.polling = undefined; }
+                on() {}
+                // Faithful to telegraf 4.16.3 (lib/telegraf.js): stop() THROWS unless
+                // something is actually running. The SIGTERM case depends on this being
+                // modelled rather than stubbed away -- a no-op stop() would have made the
+                // bug invisible, which is why it went unnoticed until Render reported it.
+                stop() {
+                    if (this.polling === undefined) throw new Error('Bot is not running!');
+                    this.polling = undefined;
+                }
+                launch() {
+                    // 401 is the one code startBouncer refuses to retry, so the child ends
+                    // up alive with polling never started -- exactly the state Render finds
+                    // it in when it sends SIGTERM to spin the instance down.
+                    if (CHILD_MODE) return Promise.reject(apiError(401, 'Unauthorized'));
+                    if (++launchCalls === 1) {
+                        return Promise.reject(apiError(409,
+                            'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running'));
+                    }
+                    this.polling = {};              // healthy: polls until stopped
+                    return new Promise(() => {});
+                }
             },
         };
     }
@@ -63,6 +91,23 @@ Module._load = function (request) {
     if (request === 'dotenv') return { config() {} };
     return origLoad.apply(this, arguments);
 };
+
+// Child mode. Asserting on a SIGTERM exit code needs a real process to signal and a
+// real code to read, which an in-process test cannot produce -- so this file re-enters
+// itself, giving us bot.js under the same stubs in a process the parent can kill.
+if (CHILD_MODE) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sportplus-bot-child-'));
+    process.chdir(tmp);                 // posted_links.json is written relative to cwd
+    Object.assign(process.env, {
+        BOT_TOKEN: 'stub',
+        CHANNEL_ID: '-1004299960350',
+        THREAD_ID: '286',
+        MAX_AGE_HOURS: '7.5',
+        PORT: '0',                      // any free port; the parent waits on the log line
+    });
+    require(BOT);
+    return;                             // valid at CJS module top level
+}
 
 const freePort = () => new Promise((res, rej) => {
     const s = net.createServer();
@@ -92,6 +137,51 @@ async function quietly(fn) {
     } finally {
         Object.assign(console, real);
     }
+}
+
+// A clean spin-down must exit 0. Render treats a non-zero exit as a FAILED instance,
+// and a failed instance is not the same as a sleeping one: on 2026-08-21 twenty
+// consecutive scheduler ticks got an instant 503 with no container ever booting.
+// Before the fix this path either threw "Bot is not running!" out of the signal handler
+// or hung until it was killed, because app.listen keeps the event loop alive.
+async function sigtermExitsClean() {
+    const { spawn } = require('child_process');
+    const child = spawn(process.execPath, [__filename], {
+        env: { ...process.env, BOT_TEST_CHILD: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const out = [];
+    child.stdout.on('data', (d) => out.push(String(d)));
+    child.stderr.on('data', (d) => out.push(String(d)));
+
+    const waitFor = (pred, ms) => new Promise((res) => {
+        const deadline = Date.now() + ms;
+        const tick = setInterval(() => {
+            if (pred()) { clearInterval(tick); res(true); }
+            else if (Date.now() > deadline) { clearInterval(tick); res(false); }
+        }, 50);
+    });
+
+    const started = await waitFor(() => out.join('').includes('Server listening'), 15000);
+    if (!started) {
+        child.kill('SIGKILL');
+        return { ok: false, detail: 'child never got as far as listening', log: out.join('') };
+    }
+
+    const exited = new Promise((res) => child.on('exit', (code, signal) => res({ code, signal })));
+    child.kill('SIGTERM');
+    const raced = await Promise.race([exited, new Promise((r) => setTimeout(() => r(null), 15000))]);
+
+    if (raced === null) {
+        child.kill('SIGKILL');
+        return { ok: false, detail: 'still running 15s after SIGTERM (never exits on its own)', log: out.join('') };
+    }
+    return {
+        ok: raced.code === 0,
+        detail: `exit code ${raced.code}${raced.signal ? ` / signal ${raced.signal}` : ''}`,
+        log: out.join(''),
+    };
 }
 
 const CASES = [
@@ -137,6 +227,19 @@ const CASES = [
     await new Promise((r) => setTimeout(r, 400)); // let app.listen bind
 
     let failed = 0;
+
+    // A rejected launch() must not take the HTTP route down with it. If the process
+    // had died on that 409 this request would not connect at all -- which is exactly
+    // how the scheduler saw 503 on every tick and switched itself off.
+    {
+        photoError = apiError(400, 'Bad Request: failed to get HTTP URL content');
+        const { result } = await quietly(() => runBot(port).catch((e) => ({ status: 'NO CONNECTION: ' + e.code })));
+        const ok = result.status === 200;
+        if (!ok) failed++;
+        console.log(`${ok ? '  PASS' : '  FAIL'}  polling died (409) -> process survives, /run-bot still serves`);
+        console.log(`        HTTP ${result.status}`);
+        fs.rmSync(path.join(tmp, 'posted_links.json'), { force: true });
+    }
     for (const c of CASES) {
         calls = [];
         photoError = c.error;
@@ -159,7 +262,24 @@ const CASES = [
         }
     }
 
+    // ...and it must come BACK, or the bouncer is silently dead until a redeploy.
+    // First backoff is 5s, so wait for it rather than racing it.
+    const deadline = Date.now() + 20000;
+    while (launchCalls < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 250));
+    const retried = launchCalls >= 2;
+    if (!retried) failed++;
+    console.log(`${retried ? '  PASS' : '  FAIL'}  polling is retried after the 409 (launch calls: ${launchCalls})`);
+
+    {
+        const r = await sigtermExitsClean();
+        if (!r.ok) failed++;
+        console.log(`${r.ok ? '  PASS' : '  FAIL'}  SIGTERM with polling stopped -> clean exit 0, not a failed instance`);
+        console.log(`        ${r.detail}`);
+        if (!r.ok) console.log(r.log.split('\n').map((l) => '        | ' + l).join('\n'));
+    }
+
+    const total = CASES.length + 3;
     fs.rmSync(tmp, { recursive: true, force: true });
-    console.log(failed ? `\n${failed} of ${CASES.length} FAILED` : `\nall ${CASES.length} passed`);
+    console.log(failed ? `\n${failed} of ${total} FAILED` : `\nall ${total} passed`);
     process.exit(failed ? 1 : 0);
 })();
