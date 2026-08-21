@@ -62,6 +62,7 @@ Module._load = function (request) {
             Telegraf: class {
                 constructor() { this.telegram = fakeTelegram; this.polling = undefined; }
                 on() {}
+                command() {}    // registered by the broadcast wiring; routing is covered in broadcast.test.cjs
                 // Faithful to telegraf 4.16.3 (lib/telegraf.js): stop() THROWS unless
                 // something is actually running. The SIGTERM case depends on this being
                 // modelled rather than stubbed away -- a no-op stop() would have made the

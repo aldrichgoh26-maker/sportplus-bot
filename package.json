@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node test/fallback.test.cjs"
+    "test": "node test/fallback.test.cjs && node test/broadcast.test.cjs"
   },
   "keywords": [],
   "author": "",

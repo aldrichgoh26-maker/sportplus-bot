@@ -3,6 +3,7 @@ const { Telegraf } = require('telegraf');
 const Parser = require('rss-parser');
 const fs = require('fs');
 const express = require('express');
+const { registerBroadcast } = require('./broadcast');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const parser = new Parser({ customFields: { item: ['enclosure', 'media:content'] } });
@@ -156,16 +157,33 @@ async function checkFeedAndPost() {
 }
 
 // --- THE BOUNCER: KEEPS THE NEWS TOPIC READ-ONLY ---
-bot.on('message', async (ctx) => {
-    // If a human sends a message specifically in the News Topic, delete it instantly
-    if (ctx.message && ctx.message.message_thread_id == THREAD_ID) {
+bot.on('message', async (ctx, next) => {
+    // If a human sends a message specifically in the News Topic, delete it instantly.
+    //
+    // Both extra guards are load-bearing. Without the THREAD_ID check, an unset
+    // THREAD_ID makes this `undefined == undefined` and the bouncer deletes every
+    // message it can see, private chats included -- and a bot that is an admin of
+    // this group sees all of them, because admin bots are exempt from privacy mode.
+    const inClosedTopic = THREAD_ID
+        && ctx.chat?.type === 'supergroup'
+        && ctx.message?.message_thread_id == THREAD_ID;
+
+    if (inClosedTopic) {
         try {
             await ctx.deleteMessage();
         } catch (err) {
             console.log('Could not delete message. Check if bot has Delete permission.');
         }
     }
+    // Always hand on. A command typed in the closed topic still deserves its reply
+    // even though the message itself is gone, and everything downstream of here is
+    // scoped to private chats anyway.
+    return next();
 });
+
+// Admin broadcast lives after the bouncer so the ordering above is explicit rather
+// than incidental: whatever the closed topic does, it does first.
+registerBroadcast(bot, { chatId: CHAT_ID });
 
 // Long polling exists ONLY for the bouncer above. It must never take the process
 // down with it: /run-bot is what the scheduler calls, and an instance that dies
