@@ -25,16 +25,34 @@ const CHILD_MODE = !!process.env.BOT_TEST_CHILD;
 
 let calls = [];
 let photoError = null; // set per case, thrown by the sendPhoto stub
+
+// The Shopify feed carries no image, so the only photo source is the article page's
+// og:image. These let a case drop the feed's enclosure and choose what that page
+// serves back, without ever leaving the process.
+let feedEnclosure = { url: 'https://bad.example/broken.jpg' };
+let pageHtml = null;            // null => the fetch itself rejects
+let photoUrls = [];             // what sendPhoto was actually handed
+
+global.fetch = async () => {
+    if (pageHtml === null) throw new Error('ENOTFOUND (stubbed)');
+    if (pageHtml === 404) return { ok: false, status: 404, async text() { return ''; } };
+    return { ok: true, status: 200, async text() { return pageHtml; } };
+};
 // Every caption the bot tried to send, photo path and text path alike. The CTA link
 // used to be a literal in the template string with nothing asserting it, which is how
 // a dead t.me handle sat in every post for two months without anyone noticing.
 let captions = [];
 
 const fakeTelegram = {
-    sendPhoto: async (_chat, _photo, opts) => {
+    sendPhoto: async (_chat, photo, opts) => {
         calls.push('sendPhoto');
+        photoUrls.push(photo);
         captions.push(opts?.caption ?? '');
-        throw photoError;
+        // Only the fallback cases arm an error. Throwing unconditionally would make a
+        // successful photo post impossible to express, which is what the og:image cases
+        // need to assert.
+        if (photoError) throw photoError;
+        return { message_id: 1 };
     },
     sendMessage: async (_chat, text) => {
         calls.push('sendMessage');
@@ -95,7 +113,7 @@ Module._load = function (request) {
                         link: 'https://example.test/article-' + Math.random(),
                         pubDate: new Date().toUTCString(), // always inside MAX_AGE_HOURS
                         contentSnippet: 'snippet',
-                        enclosure: { url: 'https://bad.example/broken.jpg' },
+                        ...(feedEnclosure ? { enclosure: feedEnclosure } : {}),
                     }],
                 };
             }
@@ -313,7 +331,61 @@ const CASES = [
         if (!r.ok) console.log(r.log.split('\n').map((l) => '        | ' + l).join('\n'));
     }
 
-    const total = CASES.length + 4;
+    // The feed lost its images in the Wix -> Shopify move and NOTHING errored: posts
+    // just quietly went text-only while /run-bot kept answering 200. These pin the
+    // replacement source, and pin that it can never cost us a post.
+    const OG_CASES = [
+        {
+            name: 'no enclosure -> photo comes from the page og:image',
+            enclosure: null,
+            html: '<meta property="og:image" content="https://cdn.example/real-photo.jpg">',
+            wantPhoto: 'https://cdn.example/real-photo.jpg',
+        },
+        {
+            // A 404 -- or any page with no image of its own -- serves the site logo.
+            // The same logo on every article hides the fact that discovery has broken.
+            name: 'og:image is the site logo -> ignored, posts text-only',
+            enclosure: null,
+            html: '<meta property="og:image" content="https://cdn.example/sportplus-logo-green.png">',
+            wantPhoto: null,
+        },
+        {
+            name: 'article page 404s -> text-only, post still lands',
+            enclosure: null, html: 404, wantPhoto: null,
+        },
+        {
+            name: 'article page unreachable -> text-only, post still lands',
+            enclosure: null, html: null, wantPhoto: null,
+        },
+        {
+            name: 'feed still has an enclosure -> page is never fetched',
+            enclosure: { url: 'https://feed.example/from-enclosure.jpg' },
+            html: '<meta property="og:image" content="https://cdn.example/should-not-be-used.jpg">',
+            wantPhoto: 'https://feed.example/from-enclosure.jpg',
+        },
+    ];
+
+    for (const c of OG_CASES) {
+        calls = []; photoUrls = [];
+        feedEnclosure = c.enclosure;
+        pageHtml = c.html;
+        photoError = null;                      // let sendPhoto succeed here
+        fs.rmSync(path.join(tmp, 'posted_links.json'), { force: true });
+
+        const { result: res } = await quietly(() => runBot(port));
+        const gotPhoto = photoUrls[0] ?? null;
+        const ok = gotPhoto === c.wantPhoto
+            && res.status === 200
+            && res.body.posted === 1;           // the article lands either way
+
+        if (!ok) failed++;
+        console.log(`${ok ? '  PASS' : '  FAIL'}  ${c.name}`);
+        console.log(`        photo=${gotPhoto ?? '(text-only)'}  HTTP ${res.status}  posted=${res.body.posted}`);
+        if (!ok) console.log(`        WANTED photo=${c.wantPhoto ?? '(text-only)'}  HTTP 200  posted=1`);
+    }
+    feedEnclosure = { url: 'https://bad.example/broken.jpg' };   // restore for any later case
+
+    const total = CASES.length + 4 + OG_CASES.length;
     fs.rmSync(tmp, { recursive: true, force: true });
     console.log(failed ? `\n${failed} of ${total} FAILED` : `\nall ${total} passed`);
     process.exit(failed ? 1 : 0);

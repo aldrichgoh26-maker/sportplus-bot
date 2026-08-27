@@ -8,7 +8,11 @@ const { registerBroadcast } = require('./broadcast');
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const parser = new Parser({ customFields: { item: ['enclosure', 'media:content'] } });
 
-const FEED_URL = 'https://www.sportplus.sg/blog-feed.xml';
+// sportplus.sg moved from Wix to Shopify on 2026-08-27. The old Wix path still
+// 301s here and rss-parser follows it, so nothing broke -- but a redirect is not a
+// contract, and the one thing standing between us and a silent outage should not be
+// somebody else's forwarding rule. Point at the real feed.
+const FEED_URL = 'https://sportplus.sg/blogs/news.atom';
 const CHAT_ID = process.env.CHANNEL_ID;
 const THREAD_ID = process.env.THREAD_ID;
 const MEMORY_FILE = 'posted_links.json';
@@ -61,6 +65,36 @@ function escapeHtml(str) {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
+}
+
+// The Wix RSS carried a per-article photo in <enclosure>. The Shopify Atom feed that
+// replaced it on 2026-08-27 carries no image ANYWHERE -- no enclosure, no media:content,
+// not even an <img> inside the content -- so every article silently became a text-only
+// post. Nothing errored and /run-bot kept answering 200, which is exactly why it went
+// unnoticed. The photo still exists one level further away, as the article page's
+// og:image, so fetch that when the feed gives us nothing.
+//
+// Image discovery must never be able to cost us the post: any failure returns undefined,
+// which lands on the existing text-only path.
+const OG_TIMEOUT_MS = 8000;
+
+async function ogImageFor(link) {
+    if (!link) return undefined;
+    try {
+        const res = await fetch(link, { signal: AbortSignal.timeout(OG_TIMEOUT_MS), redirect: 'follow' });
+        if (!res.ok) return undefined;
+        const html = await res.text();
+        const m = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+            || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
+        const img = m?.[1];
+        // A 404 -- or any page without its own image -- serves the site-wide logo as
+        // og:image. Posting the same logo on every article reads worse than posting no
+        // image at all, and it would hide the fact that discovery had stopped working.
+        if (!img || /sportplus-logo/i.test(img)) return undefined;
+        return img;
+    } catch {
+        return undefined;
+    }
 }
 
 function getPostedLinks() {
@@ -119,7 +153,9 @@ async function checkFeedAndPost() {
             // is the house rules and an invitation to introduce themselves. Ask them to
             // join rather than to reply.
             const caption = `📰 <b>${escapeHtml(title)}</b>\n\n📝 ${escapeHtml(summary)}\n\n🔗 <a href="${escapeHtml(decodeEntities(article.link))}">Read Full Article</a>\n\n📲 <b>Be part of ATHLO+</b> — <a href="${DISCUSS_URL}">more news like this, plus races, gear and training partners</a>`;
-            const imageUrl = article.enclosure?.url || article['media:content']?.$?.url;
+            const imageUrl = article.enclosure?.url
+                || article['media:content']?.$?.url
+                || await ogImageFor(article.link);
 
             const postOptions = {
                 parse_mode: 'HTML',
