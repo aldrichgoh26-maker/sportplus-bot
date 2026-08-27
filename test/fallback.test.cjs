@@ -30,6 +30,7 @@ let photoError = null; // set per case, thrown by the sendPhoto stub
 // og:image. These let a case drop the feed's enclosure and choose what that page
 // serves back, without ever leaving the process.
 let feedEnclosure = { url: 'https://bad.example/broken.jpg' };
+let feedSnippet = 'snippet';    // Shopify hands us the whole article body here
 let pageHtml = null;            // null => the fetch itself rejects
 let photoUrls = [];             // what sendPhoto was actually handed
 
@@ -112,7 +113,7 @@ Module._load = function (request) {
                         title: 'Fallback test article',
                         link: 'https://example.test/article-' + Math.random(),
                         pubDate: new Date().toUTCString(), // always inside MAX_AGE_HOURS
-                        contentSnippet: 'snippet',
+                        contentSnippet: feedSnippet,
                         ...(feedEnclosure ? { enclosure: feedEnclosure } : {}),
                     }],
                 };
@@ -385,7 +386,60 @@ const CASES = [
     }
     feedEnclosure = { url: 'https://bad.example/broken.jpg' };   // restore for any later case
 
-    const total = CASES.length + 4 + OG_CASES.length;
+    // Shopify's <summary> is the whole article, so the old 200-char slice produced
+    // "standfirst PHOTO: SPORTPLUS.SG / NAME body-text-cut-mid-wo..." on 25 of 30 live
+    // articles -- and Telegram auto-linked the bare domain inside the credit.
+    const SUMMARY_CASES = [
+        {
+            name: 'photo credit -> summary cut at the credit, bare domain goes with it',
+            snippet: 'From Former SEA Games Competitor to Mentor, Feroz is Redefining What It Means to Train with Purpose PHOTO: SPORTPLUS.SG / HANA BASIR For many in the running community, crossing the finish line is',
+            want: 'From Former SEA Games Competitor to Mentor, Feroz is Redefining What It Means to Train with Purpose',
+        },
+        {
+            // "PHOTO" alone would match first and strand a dangling "PHOTO" on the end.
+            name: '"PHOTO CREDIT:" matched whole, not as bare "PHOTO"',
+            snippet: 'Meet the Rising Star Redefining Resilience and Performance in the Community PHOTO CREDIT: YVONNE ISABELLE As we head into the season',
+            want: 'Meet the Rising Star Redefining Resilience and Performance in the Community',
+        },
+        {
+            // Cutting here would leave a stub, which is worse than the old behaviour.
+            name: 'credit too early -> keeps the 200-char behaviour instead of a stub',
+            snippet: 'PHOTO: SPORTPLUS.SG A short standfirst that carries the actual meaning of the piece and should survive.',
+            want: 'PHOTO: SPORTPLUS.SG A short standfirst that carries the actual meaning of the piece and should survive.',
+        },
+        {
+            name: 'no credit -> unchanged, still capped at 200',
+            snippet: 'x'.repeat(260),
+            want: 'x'.repeat(200) + '...',
+        },
+        {
+            name: 'newlines collapse into one readable paragraph',
+            snippet: 'Line one.\n\n   Line two.\tLine three.',
+            want: 'Line one. Line two. Line three.',
+        },
+    ];
+
+    for (const c of SUMMARY_CASES) {
+        calls = []; captions = [];
+        feedSnippet = c.snippet;
+        feedEnclosure = null; pageHtml = null;   // force the text path so we read the caption
+        photoError = null;
+        fs.rmSync(path.join(tmp, 'posted_links.json'), { force: true });
+
+        const { result: res } = await quietly(() => runBot(port));
+        const cap = captions[0] ?? '';
+        const m = cap.match(/📝 ([\s\S]*?)\n\n🔗/);
+        const got = m ? m[1] : '(no summary found)';
+        const ok = got === c.want && res.status === 200;
+
+        if (!ok) failed++;
+        console.log(`${ok ? '  PASS' : '  FAIL'}  ${c.name}`);
+        console.log(`        got:  "${got.slice(0, 105)}"`);
+        if (!ok) console.log(`        want: "${c.want.slice(0, 105)}"`);
+    }
+    feedSnippet = 'snippet';
+
+    const total = CASES.length + 4 + OG_CASES.length + SUMMARY_CASES.length;
     fs.rmSync(tmp, { recursive: true, force: true });
     console.log(failed ? `\n${failed} of ${total} FAILED` : `\nall ${total} passed`);
     process.exit(failed ? 1 : 0);

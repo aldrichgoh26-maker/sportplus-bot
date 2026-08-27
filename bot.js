@@ -67,6 +67,38 @@ function escapeHtml(str) {
         .replace(/"/g, '&quot;');
 }
 
+// Wix gave us a curated excerpt. Shopify's Atom <summary> is the WHOLE article, so
+// contentSnippet is the entire body with its tags stripped -- and the first 200
+// characters of that are the standfirst, then a photo credit, then the opening of
+// paragraph one, run together and cut mid-word. 25 of 30 live articles look like this.
+//
+// The text BEFORE the credit is the standfirst, which is exactly the summary we want,
+// so cutting there reads better than the old 200-character slice AND removes the credit.
+// It also removes the bare "SPORTPLUS.SG" that lives inside most credits, which Telegram
+// was silently turning into a link nobody asked for (14 of 30).
+//
+// PHOTO CREDIT must be tried before PHOTO, or the alternation matches the shorter one,
+// fails on the space before "CREDIT:", and leaves a dangling "PHOTO" on the end.
+const CREDIT_MARKER = /\b(?:PHOTO\s+CREDIT|PHOTOS|PHOTO|IMAGES|IMAGE|CREDIT)\s*:/i;
+const SUMMARY_MAX = 200;
+const SUMMARY_MIN = 40;
+
+function summarise(snippet) {
+    let s = decodeEntities(snippet || 'Click the link to read more.')
+        .replace(/\s+/g, ' ')       // the body arrives with newlines; one clean paragraph reads better
+        .trim();
+
+    const at = s.search(CREDIT_MARKER);
+    if (at > 0) {
+        const head = s.slice(0, at).trim().replace(/[\s,;:.–—-]+$/, '');
+        // A credit near the very start would leave a stub, which is worse than the
+        // old behaviour. Only take the head when there is a real sentence in it.
+        if (head.length >= SUMMARY_MIN) s = head;
+    }
+
+    return s.length > SUMMARY_MAX ? s.substring(0, SUMMARY_MAX) + '...' : s;
+}
+
 // The Wix RSS carried a per-article photo in <enclosure>. The Shopify Atom feed that
 // replaced it on 2026-08-27 carries no image ANYWHERE -- no enclosure, no media:content,
 // not even an <img> inside the content -- so every article silently became a text-only
@@ -143,8 +175,7 @@ async function checkFeedAndPost() {
         for (const article of articlesToPost) {
             // Decode before truncating so the 200 limit counts real characters
             // and we can never slice through the middle of an entity.
-            let summary = decodeEntities(article.contentSnippet || "Click the link to read more.");
-            if (summary.length > 200) summary = summary.substring(0, 200) + '...';
+            const summary = summarise(article.contentSnippet);
             const title = decodeEntities(article.title);
 
             // "Chat about this" only spoke to people already in the group. These posts
