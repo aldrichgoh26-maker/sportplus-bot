@@ -38,7 +38,15 @@ const MAX_AGE_HOURS = Number(process.env.MAX_AGE_HOURS || 48);
 // 2026-08-21; 332 is the rebuilt one. A dead id here is not fatal -- the link
 // degrades to the group page, which is what it did before any of this -- but it
 // wastes the only CTA a reader gets, so it is worth keeping current.
-const DISCUSS_URL = process.env.DISCUSS_URL || 'https://t.me/ATHLObySportPlus/332';
+//
+// THE HANDLE IS THE OTHER HALF, AND IT IS THE HALF THAT BREAKS SILENTLY. Renaming
+// the group retires its username: this was @SportPlusTHEHUB, then
+// @ATHLObySportPlus, and since 2026-08-28 it is @SportPlusXATHLO. A retired handle
+// does NOT 404 -- t.me serves a bare "Contact" page with no join button -- so every
+// post keeps rendering a link that looks fine and goes nowhere joinable. That is
+// exactly how the dead handle rode two months of posts before. Read the current one
+// off getChat(-1004299960350).username rather than trusting this line or the env.
+const DISCUSS_URL = process.env.DISCUSS_URL || 'https://t.me/SportPlusXATHLO/332';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
