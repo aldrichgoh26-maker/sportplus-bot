@@ -191,7 +191,12 @@ async function checkFeedAndPost() {
             // resolves for non-members too -- landing them on the pinned welcome, which
             // is the house rules and an invitation to introduce themselves. Ask them to
             // join rather than to reply.
-            const caption = `📰 <b>${escapeHtml(title)}</b>\n\n📝 ${escapeHtml(summary)}\n\n🔗 <a href="${escapeHtml(decodeEntities(article.link))}">Read Full Article</a>\n\n📲 <b>Be part of ATHLO+</b> — <a href="${DISCUSS_URL}">more news like this, plus races, gear and training partners</a>`;
+            //
+            // It names BOTH brands as of 2026-08-31, when the bot became Spark, the
+            // mascot they share. The wording is the only thing that changed -- the link
+            // target is untouched, because this line is what converts a reader into a
+            // member and there was no reason to disturb the half that works.
+            const caption = `📰 <b>${escapeHtml(title)}</b>\n\n📝 ${escapeHtml(summary)}\n\n🔗 <a href="${escapeHtml(decodeEntities(article.link))}">Read Full Article</a>\n\n📲 <b>Be part of SportPlus × ATHLO+</b> — <a href="${DISCUSS_URL}">more news like this, plus races, gear and training partners</a>`;
             const imageUrl = article.enclosure?.url
                 || article['media:content']?.$?.url
                 || await ogImageFor(article.link);

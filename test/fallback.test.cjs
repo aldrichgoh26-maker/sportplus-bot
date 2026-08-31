@@ -314,6 +314,18 @@ const CASES = [
         if (!ok) failed++;
         console.log(`${ok ? '  PASS' : '  FAIL'}  the chat CTA rides both the photo caption and the text fallback`);
         console.log(`        sends=${captions.length}  carrying DISCUSS_URL=${carrying}`);
+
+        // The CTA names BOTH brands, and only this asserts it. The check above pins the
+        // LINK, which is why the wording could be changed to drop a brand and every test
+        // would still pass -- the same shape of blind spot that let a dead group handle
+        // ride every post for two months. Spark represents the two brands together; if
+        // one of them stops being named here, that is a decision, not a typo, and it
+        // should have to come past this line.
+        const brands = captions.filter((c) => c.includes('SportPlus') && c.includes('ATHLO+')).length;
+        const bothOk = captions.length === 2 && brands === 2;
+        if (!bothOk) failed++;
+        console.log(`${bothOk ? '  PASS' : '  FAIL'}  the CTA names both SportPlus and ATHLO+, on both paths`);
+        console.log(`        captions naming both=${brands}/${captions.length}`);
     }
 
     // ...and it must come BACK, or the bouncer is silently dead until a redeploy.
@@ -439,7 +451,10 @@ const CASES = [
     }
     feedSnippet = 'snippet';
 
-    const total = CASES.length + 4 + OG_CASES.length + SUMMARY_CASES.length;
+    // The `+ 5` is the hand-counted block of one-off checks between the table-driven
+    // groups. It is a literal, so it has to move whenever one is added -- it went 4 -> 5
+    // when the CTA gained its both-brands assertion.
+    const total = CASES.length + 5 + OG_CASES.length + SUMMARY_CASES.length;
     fs.rmSync(tmp, { recursive: true, force: true });
     console.log(failed ? `\n${failed} of ${total} FAILED` : `\nall ${total} passed`);
     process.exit(failed ? 1 : 0);
