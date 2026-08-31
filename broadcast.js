@@ -322,8 +322,8 @@ function makeDraftStore({ now = Date.now } = {}) {
 // ---------------------------------------------------------------------------
 
 const HELP = [
-    'Send me what you want to put in the group. I will show it back to you with a button',
-    'for each topic -- nothing is posted until you tap one.',
+    "Hi — I'm Spark. Send me what you want in the group and I'll show it back to you",
+    'with a button for each topic -- nothing is posted until you tap one.',
     '',
     'Works with: text, photos, videos, GIFs, files, and albums (several photos or videos',
     'sent together). Add a caption and it rides along.',
@@ -343,7 +343,9 @@ const HELP = [
 // what it is for, not who can drive it. It is a line rather than silence because on
 // this host silence is genuinely ambiguous -- the bot has been down for a week at a
 // time, and "no answer" has to keep meaning that.
-const NOT_FOR_YOU = 'This bot posts updates to the SportPlus | ATHLO+ group.';
+// No link in here on purpose. The group handle already lives in four places and dies
+// on every rename; a fifth copy buys one tappable link and costs another thing to miss.
+const NOT_FOR_YOU = "Hi — I'm Spark, the SportPlus and ATHLO+ mascot. I post sports news into our Telegram group.";
 
 // Telegram splits an album into one update PER ITEM, all sharing a media_group_id,
 // delivered back to back. There is no "album finished" signal, so the only way to
