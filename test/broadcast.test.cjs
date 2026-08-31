@@ -613,6 +613,65 @@ function check(name, ok, detail) {
         toGroup().length === 0 && !preview() && replies.length === 1,
         `groupSends=${toGroup().length} previews=${preview() ? 1 : 0} replies=${replies.length}`);
 
+    // --- the reconnaissance gap ------------------------------------------------
+    //
+    // Until 2026-08-31 the admin gate was on the handlers that PUBLISH and absent from
+    // the handlers that INFORM. /here answered anyone, in any chat, with the chat id
+    // and the topic id. /help handed a stranger the whole capability list. /cancel
+    // confirmed a draft system existed. None of them post anything, which is exactly
+    // why nobody noticed. These four cases fail against the old code.
+
+    // 27. /here was the worst of them: real ids, to anyone who asked.
+    reset();
+    await bot.dispatch(dm(STRANGER, '/here'));
+    const hereLeaksNothing = toGroup().length === 0
+        && replies.length === 1
+        && !/chat id/i.test(replies[0])
+        && !new RegExp(GROUP).test(replies[0]);
+
+    reset();
+    await bot.dispatch(dm(OWNER, '/here'));
+    const hereStillWorksForAdmins = replies.some((r) => /chat id/i.test(r));
+
+    check('/here gives a stranger no ids, and still answers an admin',
+        hereLeaksNothing && hereStillWorksForAdmins,
+        `strangerBlocked=${hereLeaksNothing} adminWorks=${hereStillWorksForAdmins}`);
+
+    // 28. In the GROUP a non-admin gets nothing at all. A neutral line is right in a
+    //     DM, where silence reads as "the bot is down"; in a topic it would let any
+    //     member make the bot speak by typing a command at it.
+    reset();
+    await bot.dispatch(groupMsg(STRANGER, '/here', 999));
+    const silentInGroup = replies.length === 0 && toGroup().length === 0;
+    reset();
+    await bot.dispatch(groupMsg(STRANGER, '/poll Q | A | B', 999));
+    const pollSilentInGroup = replies.length === 0 && toGroup().length === 0;
+    check('a non-admin command in the group is answered with silence, not a line',
+        silentInGroup && pollSilentInGroup,
+        `here=${silentInGroup} poll=${pollSilentInGroup}`);
+
+    // 29. /help described the broadcast and poll flow to anyone who typed it.
+    reset();
+    await bot.dispatch(dm(STRANGER, '/help'));
+    const helpWithheld = replies.length === 1 && !/albums/i.test(replies[0]) && !/topic/i.test(replies[0]);
+    reset();
+    await bot.dispatch(dm(OWNER, '/help'));
+    const helpForAdmin = replies.some((r) => /albums/i.test(r));
+    check('/help withholds the capability list from a stranger, keeps it for an admin',
+        helpWithheld && helpForAdmin,
+        `strangerBlocked=${helpWithheld} adminWorks=${helpForAdmin}`);
+
+    // 30. /start is the first thing anyone who finds the bot will send.
+    reset();
+    await bot.dispatch(dm(STRANGER, '/start'));
+    const startWithheld = replies.length === 1 && !/albums/i.test(replies[0]);
+    reset();
+    await bot.dispatch(dm(STRANGER, '/cancel'));
+    const cancelWithheld = replies.length === 1 && !/nothing to cancel/i.test(replies[0]);
+    check('/start and /cancel tell a stranger nothing about the machinery',
+        startWithheld && cancelWithheld,
+        `start=${startWithheld} cancel=${cancelWithheld}`);
+
     // 10. The bouncer still bounces -- and only in the closed topic.
     reset();
     await bot.dispatch(groupMsg(STRANGER, 'hello', NEWS_THREAD));
