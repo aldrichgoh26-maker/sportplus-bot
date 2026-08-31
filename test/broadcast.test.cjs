@@ -27,6 +27,7 @@ let sends = [];        // every sendMessage/sendPhoto, with the chat it targeted
 let replies = [];      // ctx.reply -- what the admin sees in the DM
 let answers = [];      // ctx.answerCbQuery -- the toast on the button
 let deletions = [];    // ctx.deleteMessage -- the bouncer
+let edits = [];        // ctx.editMessageText -- redrawing a poll preview after a toggle
 let adminsError = null;
 let replyError = null;
 let msgId = 1000;
@@ -42,6 +43,13 @@ const fakeTelegram = {
     },
     sendVideo: async (chat, file, opts = {}) => {
         sends.push({ kind: 'video', chat: String(chat), file, opts });
+        return { message_id: ++msgId };
+    },
+    // Positional, exactly like telegraf's: (chat, question, options, extra). The
+    // stub keeps `options` raw so a test can assert it is InputPollOption objects
+    // and not the string[] telegraf's stale typings still promise.
+    sendPoll: async (chat, question, options, opts = {}) => {
+        sends.push({ kind: 'poll', chat: String(chat), question, options, opts });
         return { message_id: ++msgId };
     },
     sendAnimation: async (chat, file, opts = {}) => {
@@ -104,6 +112,7 @@ class StubTelegraf {
             },
             answerCbQuery: async (t) => { answers.push(t ?? ''); },
             editMessageReplyMarkup: async () => {},
+            editMessageText: async (text, extra) => { edits.push({ text, extra }); },
             deleteMessage: async () => { deletions.push(update.message?.message_id ?? '?'); },
         };
         let i = 0;
@@ -177,7 +186,7 @@ const tap = (from, data) => ({
     },
 });
 
-function reset() { sends = []; replies = []; answers = []; deletions = []; adminsError = null; replyError = null; }
+function reset() { sends = []; replies = []; answers = []; deletions = []; edits = []; adminsError = null; replyError = null; }
 const toGroup = () => sends.filter((s) => s.chat === GROUP);
 const toDm = () => sends.filter((s) => s.chat !== GROUP);
 const preview = () => toDm()[0];
@@ -432,6 +441,177 @@ function check(name, ok, detail) {
             landed && toldSent && toGroup().length === 1 && answers.some((a) => /already sent/i.test(a)),
             `posted=${toGroup().length} toast="${answers[0] ?? ''}"`);
     }
+
+    // --- polls ---------------------------------------------------------------
+    //
+    // A poll is the one draft the admin cannot hand us ready-made: Telegram's clients
+    // have no poll composer in a DM, so it is typed as text and the preview is our own
+    // rendering. Everything below is therefore guarding two things the message path
+    // never had to -- that the text became the poll the admin meant, and that a shape
+    // Telegram would refuse is caught here rather than at confirm time.
+
+    // 16. Same first invariant as a broadcast: typing is not publishing.
+    reset();
+    await bot.dispatch(dm(OWNER, '/poll Which race next?\nStandard Chartered\nSundown', [
+        { type: 'bot_command', offset: 0, length: 5 },
+    ]));
+    {
+        const p = preview();
+        const rendered = p?.text || '';
+        check('/poll -> preview in the DM only, no poll created yet',
+            toGroup().length === 0 && sends.every((s) => s.kind !== 'poll')
+            && /Which race next\?/.test(rendered)
+            && /1\. Standard Chartered/.test(rendered) && /2\. Sundown/.test(rendered)
+            && /Anonymous · one answer/.test(rendered) && !!buttonFor('General'),
+            `groupSends=${toGroup().length} polls=${sends.filter((s) => s.kind === 'poll').length} preview=${JSON.stringify(rendered)}`);
+    }
+
+    // 17. The tap is what creates it. Options must be InputPollOption objects: the
+    //     Bot API changed that in 7.3 and telegraf 4.16.3's typings still say string[],
+    //     so nothing but this assertion stands between us and the deprecated shape.
+    {
+        const data = buttonFor('News');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const g = toGroup();
+        const poll = g[0];
+        check('tapping News -> one sendPoll into thread 286, defaults anonymous + single',
+            g.length === 1 && poll?.kind === 'poll'
+            && poll.question === 'Which race next?'
+            && JSON.stringify(poll.options) === JSON.stringify([{ text: 'Standard Chartered' }, { text: 'Sundown' }])
+            && poll.opts.is_anonymous === true && poll.opts.allows_multiple_answers === false
+            && poll.opts.message_thread_id === NEWS_THREAD,
+            `sends=${g.length} kind=${poll?.kind} options=${JSON.stringify(poll?.options)} opts=${JSON.stringify(poll?.opts)}`);
+
+        // 18. A poll cannot be un-posted and its votes cannot be recovered, so the
+        //     double-tap guard matters more here than for a message.
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        check('double tap on a poll -> refused, no second poll',
+            toGroup().length === 0 && answers.some((a) => /already sent/i.test(a)),
+            `sends=${toGroup().length} answer="${answers[0] ?? ''}"`);
+    }
+
+    // 19. Both toggles, then send. is_anonymous and allows_multiple_answers are fixed
+    //     at creation -- no API call changes them afterwards -- so the preview is the
+    //     only place they can be set, and the redraw has to keep up with the state.
+    reset();
+    await bot.dispatch(dm(OWNER, '/poll Training this week?\nTrack\nLong run\nRest', [
+        { type: 'bot_command', offset: 0, length: 5 },
+    ]));
+    {
+        const data = buttonFor('General');
+        reset();
+        await bot.dispatch(tap(OWNER, data.replace(/:\d+$/, ':a')));
+        await bot.dispatch(tap(OWNER, data.replace(/:\d+$/, ':m')));
+        const redrawn = edits[edits.length - 1]?.text || '';
+        const keys = (edits[edits.length - 1]?.extra?.reply_markup?.inline_keyboard || []).flat().map((b) => b.text);
+        const toggled = edits.length === 2
+            && /Names shown · multiple answers/.test(redrawn)
+            && keys.some((t) => /Names shown/.test(t)) && keys.some((t) => /Multiple answers/.test(t));
+
+        await bot.dispatch(tap(OWNER, data));
+        const poll = toGroup()[0];
+        check('toggles flip the poll and redraw the preview in step',
+            toggled && toGroup().length === 1
+            && poll.opts.is_anonymous === false && poll.opts.allows_multiple_answers === true,
+            `edits=${edits.length} redrawn=${JSON.stringify(redrawn)} opts=${JSON.stringify(poll?.opts)}`);
+
+        // 20. Once it is out there, its shape is history -- a toggle must not read as
+        //     if it changed the poll people are already voting in.
+        reset();
+        await bot.dispatch(tap(OWNER, data.replace(/:\d+$/, ':a')));
+        check('toggling an already-sent poll -> refused, nothing redrawn',
+            edits.length === 0 && toGroup().length === 0 && answers.some((a) => /already sent/i.test(a)),
+            `edits=${edits.length} answer="${answers[0] ?? ''}"`);
+    }
+
+    // 21. Enter SENDS on Telegram Desktop, so one-option-per-line costs a shift-enter
+    //     each. The single-line pipe form is the same poll without that hazard.
+    reset();
+    await bot.dispatch(dm(OWNER, '/poll Shoe day? | Yes | No | Maybe', [
+        { type: 'bot_command', offset: 0, length: 5 },
+    ]));
+    {
+        const data = buttonFor('General');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const poll = toGroup()[0];
+        check('single line split on "|" -> same question and options',
+            poll?.question === 'Shoe day?'
+            && JSON.stringify(poll?.options) === JSON.stringify([{ text: 'Yes' }, { text: 'No' }, { text: 'Maybe' }]),
+            `question=${JSON.stringify(poll?.question)} options=${JSON.stringify(poll?.options)}`);
+    }
+
+    // 22. Someone writing a list writes it as a list, and Telegram numbers the
+    //     options itself -- "1. 1. Track" is what not stripping looks like.
+    reset();
+    await bot.dispatch(dm(OWNER, '/poll Pick one\n1. Track\n- Road\n• Trail', [
+        { type: 'bot_command', offset: 0, length: 5 },
+    ]));
+    {
+        const data = buttonFor('General');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const poll = toGroup()[0];
+        check('list markers stripped from options, question left alone',
+            JSON.stringify(poll?.options) === JSON.stringify([{ text: 'Track' }, { text: 'Road' }, { text: 'Trail' }]),
+            `options=${JSON.stringify(poll?.options)}`);
+    }
+
+    // 23. Every shape Telegram would refuse, refused here instead -- with the number,
+    //     because "too long" without a count tells the admin nothing about the cut.
+    {
+        const cases = [
+            ['no options at all', '/poll Just a question', /at least two options/i],
+            ['one option', '/poll Question\nOnly this', /at least two options/i],
+            ['13 options', '/poll Q\n' + Array.from({ length: 13 }, (_, i) => `opt ${i}`).join('\n'), /13 options.*caps a poll at 12/i],
+            ['301-character question', '/poll ' + 'q'.repeat(301) + '\nA\nB', /301 characters.*caps it at 300/i],
+            ['101-character option', '/poll Q\nA\n' + 'b'.repeat(101), /Option 2 is 101 characters/i],
+        ];
+        let allRefused = true;
+        const detail = [];
+        for (const [name, text, expect] of cases) {
+            reset();
+            await bot.dispatch(dm(OWNER, text, [{ type: 'bot_command', offset: 0, length: 5 }]));
+            const ok = toGroup().length === 0 && !preview() && replies.some((r) => expect.test(r));
+            if (!ok) allRefused = false;
+            detail.push(`${name}=${ok}`);
+        }
+        check('polls Telegram would reject are refused up front, with the number',
+            allRefused, detail.join(' '));
+    }
+
+    // 24. Telegram counts characters; JS counts UTF-16 code units. Measuring with
+    //     .length would refuse a 200-emoji question as if it were 400.
+    reset();
+    await bot.dispatch(dm(OWNER, '/poll ' + '🏃'.repeat(200) + '\nA\nB', [
+        { type: 'bot_command', offset: 0, length: 5 },
+    ]));
+    check('an emoji question under the limit is measured in characters, not code units',
+        !!preview() && replies.length === 0,
+        `preview=${!!preview()} replies=${JSON.stringify(replies)}`);
+
+    // 25. Drafting in the group would show the half-written version to the people it
+    //     is for. Answering anyway matters because on this host silence is genuinely
+    //     ambiguous -- but only admins get the nudge, or it becomes a way to make the
+    //     bot talk in a topic.
+    reset();
+    await bot.dispatch(groupMsg(OWNER, '/poll Question\nA\nB', 999));
+    const adminNudged = toGroup().length === 0 && replies.some((r) => /in a DM/i.test(r));
+    reset();
+    await bot.dispatch(groupMsg(STRANGER, '/poll Question\nA\nB', 999));
+    const strangerIgnored = toGroup().length === 0 && replies.length === 0;
+    check('/poll in the group -> admin is redirected to the DM, a member gets silence',
+        adminNudged && strangerIgnored,
+        `admin=${adminNudged} stranger=${strangerIgnored}`);
+
+    // 26. Same gate as everything else: a stranger cannot start one.
+    reset();
+    await bot.dispatch(dm(STRANGER, '/poll Question\nA\nB', [{ type: 'bot_command', offset: 0, length: 5 }]));
+    check('non-admin /poll -> nothing drafted, nothing created',
+        toGroup().length === 0 && !preview() && replies.length === 1,
+        `groupSends=${toGroup().length} previews=${preview() ? 1 : 0} replies=${replies.length}`);
 
     // 10. The bouncer still bounces -- and only in the closed topic.
     reset();
