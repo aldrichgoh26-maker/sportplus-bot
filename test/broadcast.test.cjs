@@ -158,10 +158,12 @@ const dm = (from, text, entities) => ({
         from: { id: from },
     },
 });
-const groupMsg = (from, text, thread) => ({
+// chatId defaults to OUR group; pass another to model the bot sitting in someone
+// else's forum, which is the only way to test that the bouncer stays at home.
+const groupMsg = (from, text, thread, chatId = Number(GROUP)) => ({
     message: {
         message_id: ++msgId, text, message_thread_id: thread,
-        chat: { id: Number(GROUP), type: 'supergroup' },
+        chat: { id: chatId, type: 'supergroup' },
         from: { id: from },
     },
 });
@@ -685,6 +687,17 @@ function check(name, ok, detail) {
     check('bouncer deletes in the closed topic only, never a DM or another topic',
         deletedInNews && keptElsewhere && keptInDm,
         `news=${deletedInNews} otherTopic=${keptElsewhere} dm=${keptInDm}`);
+
+    // 31. ...and never in someone ELSE'S forum. Thread ids are per-chat and start
+    //     small, so our NEWS number exists in plenty of other groups; matching on the
+    //     thread alone made the bouncer delete strangers' messages in any supergroup
+    //     that happened to share it. Unreachable while can_join_groups is false, which
+    //     is a BotFather toggle in another system and therefore not a guard.
+    reset();
+    await bot.dispatch(groupMsg(STRANGER, 'hello', NEWS_THREAD, -1009999999999));
+    check('bouncer stays at home: same thread id in another group is left alone',
+        deletions.length === 0,
+        `deletions in a foreign group=${deletions.length}`);
 
     // 11. The dangerous config. THREAD_ID unset used to make the guard compare
     //     undefined to undefined, which is true for every message the bot can see

@@ -249,12 +249,21 @@ async function checkFeedAndPost() {
 bot.on('message', async (ctx, next) => {
     // If a human sends a message specifically in the News Topic, delete it instantly.
     //
-    // Both extra guards are load-bearing. Without the THREAD_ID check, an unset
+    // All three guards are load-bearing. Without the THREAD_ID check, an unset
     // THREAD_ID makes this `undefined == undefined` and the bouncer deletes every
     // message it can see, private chats included -- and a bot that is an admin of
     // this group sees all of them, because admin bots are exempt from privacy mode.
+    //
+    // The chat id check answers a question nobody had asked until now: what does this
+    // do in a DIFFERENT group? Thread ids are per-chat and start small, so "397" exists
+    // in plenty of forums, and matching on the thread alone meant any supergroup whose
+    // topic happened to share our number would have its messages deleted by us. That is
+    // unreachable today only because `can_join_groups` is false, which is a BotFather
+    // toggle somebody could flip for an unrelated reason years from now -- a guard that
+    // depends on a setting in another system is not a guard.
     const inClosedTopic = THREAD_ID
         && ctx.chat?.type === 'supergroup'
+        && String(ctx.chat.id) === String(CHAT_ID)
         && ctx.message?.message_thread_id == THREAD_ID;
 
     if (inClosedTopic) {
