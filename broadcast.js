@@ -1,7 +1,8 @@
 'use strict';
 
 // Admin broadcast: an admin DMs the bot, the bot shows the message back as a
-// preview, and nothing reaches the group until a button is tapped.
+// preview, and nothing reaches the group until a button is tapped. Polls ride the
+// same gate -- see the Polls section for why they cannot ride the same INPUT.
 //
 // The confirm gate is the whole design. Posting into a public group is not
 // undoable in any meaningful sense -- people have already read it -- so the
@@ -70,9 +71,9 @@ function parseTargets(spec) {
 
 // Offsets are UTF-16 code units, which is also how JS indexes strings, so plain
 // slicing stays in step with them -- including across emoji surrogate pairs.
-function stripLeadingPost(text, entities) {
+function stripLeadingPost(text, entities, command = 'post') {
     const raw = String(text ?? '');
-    const m = /^\/post(?:@[A-Za-z0-9_]+)?(?:\s+|$)/.exec(raw);
+    const m = new RegExp(`^/${command}(?:@[A-Za-z0-9_]+)?(?:\\s+|$)`).exec(raw);
     if (!m) return { text: raw, entities: entities || [] };
 
     const cut = m[0].length;
@@ -86,6 +87,95 @@ function stripLeadingPost(text, entities) {
     }
     return { text: raw.slice(cut), entities: shifted };
 }
+
+// ---------------------------------------------------------------------------
+// Polls
+// ---------------------------------------------------------------------------
+
+// A poll cannot be handed to the bot the way a photo can. Telegram's clients only
+// offer the poll composer in groups and channels -- there is no Poll button in a
+// one-to-one chat with a bot -- so the admin types it and the preview is our own
+// rendering of what the group will get, not a real poll bounced back.
+//
+// That rendering is the last place a typo can be caught, and it matters more here
+// than for a message: there is no editMessageText for a poll. A wrong poll can only
+// be deleted and re-run, and every vote already cast goes with it.
+
+const POLL_QUESTION_MAX = 300;   // sendPoll: "Poll question, 1-300 characters"
+const POLL_OPTION_MAX = 100;     // InputPollOption.text: "Option text, 1-100 characters"
+const POLL_OPTIONS_MAX = 12;     // sendPoll: "a JSON-serialized list of 1-12 answer options"
+// The API's own floor is 1. One option is not a poll anybody meant to write -- it is
+// what you get when the separators were wrong -- so reject it here, where we can say
+// so, rather than posting a poll with a single button.
+const POLL_OPTIONS_MIN = 2;
+
+// Telegram counts characters; JS counts UTF-16 code units, so "🏃" is 1 to them and 2
+// to .length. Counting code points keeps an emoji-heavy question from being refused
+// for a limit it never reached.
+const charLen = (s) => [...String(s)].length;
+
+// An admin writing a list writes it as a list. Neither "1." nor "-" belongs in the
+// option text -- Telegram numbers the options itself.
+const stripBullet = (s) => String(s).replace(/^\s*(?:[-*•–—]|\d{1,2}[.)])\s+/, '').trim();
+
+// Enter SENDS on Telegram Desktop, so one option per line costs a shift-enter each
+// and a slip mid-draft fires a half-written poll at the bot. A single line split on
+// "|" is the same poll with no shift-enters, so accept both and let the shape of
+// what arrived decide which it was: more than one line means lines.
+function parsePoll(raw) {
+    const body = String(raw ?? '').trim();
+    if (!body) return { error: 'usage' };
+
+    const lines = body.split('\n').map((s) => s.trim()).filter(Boolean);
+    const fields = lines.length > 1 ? lines : lines[0].split('|').map((s) => s.trim()).filter(Boolean);
+
+    const question = fields.shift() || '';
+    const options = fields.map(stripBullet).filter(Boolean);
+
+    if (!question) return { error: 'usage' };
+    if (options.length < POLL_OPTIONS_MIN) return { error: 'usage' };
+    if (options.length > POLL_OPTIONS_MAX) {
+        return { error: `That is ${options.length} options -- Telegram caps a poll at ${POLL_OPTIONS_MAX}.` };
+    }
+    if (charLen(question) > POLL_QUESTION_MAX) {
+        return { error: `The question is ${charLen(question)} characters; Telegram caps it at ${POLL_QUESTION_MAX}.` };
+    }
+    const long = options.findIndex((o) => charLen(o) > POLL_OPTION_MAX);
+    if (long !== -1) {
+        return { error: `Option ${long + 1} is ${charLen(options[long])} characters; Telegram caps each one at ${POLL_OPTION_MAX}.` };
+    }
+
+    return { question, options };
+}
+
+const pollFooter = (d) =>
+    `${d.isAnonymous ? '🕶 Anonymous' : '👤 Names shown'} · ${d.multiple ? 'multiple answers' : 'one answer'}`;
+
+// Sent as plain text, no parse_mode -- same reasoning as a broadcast. The question
+// is the admin's own words and a stray "<" in it must not 400 the preview.
+function renderPoll(draft) {
+    return [
+        `🗳 ${draft.question}`,
+        '',
+        ...draft.options.map((o, i) => `${i + 1}. ${o}`),
+        '',
+        pollFooter(draft),
+    ].join('\n');
+}
+
+const POLL_USAGE = [
+    'A poll is a question and at least two options.',
+    '',
+    '/poll Which race should we cover next?',
+    'Standard Chartered',
+    'Sundown',
+    '',
+    'One option per line (shift+enter on desktop), or all on one line separated by "|":',
+    '',
+    '/poll Which race? | Standard Chartered | Sundown',
+    '',
+    'Anonymous and one-answer by default -- both are buttons on the preview.',
+].join('\n');
 
 // ---------------------------------------------------------------------------
 // Media
@@ -240,10 +330,20 @@ const HELP = [
     '',
     'Formatting you apply here (bold, italics, links) is carried through exactly.',
     '',
+    '/poll -- start a poll. Question on the first line, one option per line after it,',
+    '        or all on one line separated by "|". Anonymous and one-answer by',
+    '        default; both are buttons on the preview.',
+    '',
     '/here -- show the id of the topic this was typed in',
     '/cancel -- drop your most recent draft',
     '/help -- this message',
 ].join('\n');
+
+// Deny by default, and say nothing about why. A stranger who finds the bot learns
+// what it is for, not who can drive it. It is a line rather than silence because on
+// this host silence is genuinely ambiguous -- the bot has been down for a week at a
+// time, and "no answer" has to keep meaning that.
+const NOT_FOR_YOU = 'This bot posts updates to the SportPlus | ATHLO+ group.';
 
 // Telegram splits an album into one update PER ITEM, all sharing a media_group_id,
 // delivered back to back. There is no "album finished" signal, so the only way to
@@ -270,8 +370,18 @@ function registerBroadcast(bot, opts) {
         return { drafts, targets };
     }
 
-    const keyboardFor = (id) => {
+    // A poll draft gets two extra buttons above the topics. They show the state the
+    // poll is IN, not the state a tap would move it to -- the same convention as the
+    // footer line in the preview text, which is edited in step with them so the two
+    // can never disagree.
+    const keyboardFor = (id, draft) => {
         const rows = [];
+        if (draft?.kind === 'poll') {
+            rows.push([
+                { text: draft.isAnonymous ? '🕶 Anonymous' : '👤 Names shown', callback_data: `bc:${id}:a` },
+                { text: draft.multiple ? '🔢 Multiple answers' : '☝️ One answer', callback_data: `bc:${id}:m` },
+            ]);
+        }
         for (let i = 0; i < targets.length; i += 2) {
             rows.push(targets.slice(i, i + 2).map((t, j) => ({
                 text: `📣 ${t.name}`,
@@ -306,13 +416,58 @@ function registerBroadcast(bot, opts) {
         await ctx.reply('Draft dropped.');
     });
 
+    bot.command('poll', async (ctx) => {
+        // Drafting in the group would put the half-written version in front of the
+        // people it is for, which is the whole thing the preview exists to prevent.
+        // Answer anyway rather than ignoring it: an admin who types /poll in a topic
+        // and gets nothing back has no way to tell that from the bot being down --
+        // and on this host that is a real possibility, not a hypothetical one. Only
+        // admins get the nudge, so a member cannot use it to make the bot talk.
+        if (ctx.chat?.type !== 'private') {
+            if (await isAdmin(ctx.from.id)) {
+                await ctx.reply('Send /poll to me in a DM -- you get a preview there, and a poll cannot be edited once it is posted.');
+            }
+            return;
+        }
+        if (!(await isAdmin(ctx.from.id))) return void await ctx.reply(NOT_FOR_YOU);
+
+        const { text } = stripLeadingPost(ctx.message?.text ?? '', [], 'poll');
+        const parsed = parsePoll(text);
+        if (parsed.error) return void await ctx.reply(parsed.error === 'usage' ? POLL_USAGE : parsed.error);
+
+        await showPollPreview(ctx.chat.id, {
+            from: ctx.from.id,
+            kind: 'poll',
+            question: parsed.question,
+            options: parsed.options,
+            isAnonymous: true,
+            multiple: false,
+        });
+    });
+
     const albums = new Map();   // media_group_id -> { items, from, chatId, timer }
 
     // The preview IS the message: same text, same entities, same file ids. There is
     // no second rendering path that could differ from what the group will see.
+    // The toggles mutate the STORED draft, so read it back rather than rendering the
+    // caller's object -- drafts.put() copies, and a preview drawn from the copy would
+    // stop matching what the buttons are editing after the first tap.
+    async function showPollPreview(chatId, draft) {
+        const id = drafts.put(draft);
+        const stored = drafts.get(id);
+        try {
+            await telegram.sendMessage(chatId, renderPoll(stored), { reply_markup: keyboardFor(id, stored) });
+        } catch (err) {
+            drafts.delete(id);
+            const why = err?.response?.description || err?.message;
+            console.error('❌ Could not show the poll preview:', why);
+            await telegram.sendMessage(chatId, `Could not build a preview: ${why}`).catch(() => {});
+        }
+    }
+
     async function showPreview(chatId, draft) {
         const id = drafts.put(draft);
-        const markup = keyboardFor(id);
+        const markup = keyboardFor(id, draft);
         try {
             if (draft.media.length > 1) {
                 // sendMediaGroup takes no reply_markup -- an album physically cannot
@@ -372,10 +527,8 @@ function registerBroadcast(bot, opts) {
     bot.on('message', async (ctx) => {
         if (ctx.chat?.type !== 'private') return;
 
-        // Deny by default, and say nothing about why. A stranger who finds the bot
-        // learns what it is for, not who can drive it.
         if (!(await isAdmin(ctx.from.id))) {
-            await ctx.reply('This bot posts updates to the SportPlus | ATHLO+ group.');
+            await ctx.reply(NOT_FOR_YOU);
             return;
         }
 
@@ -444,7 +597,7 @@ function registerBroadcast(bot, opts) {
 
     bot.on('callback_query', async (ctx) => {
         const data = ctx.callbackQuery?.data || '';
-        const m = /^bc:([A-Za-z0-9_-]+):(\d+|x)$/.exec(data);
+        const m = /^bc:([A-Za-z0-9_-]+):(\d+|x|a|m)$/.exec(data);
         if (!m) return;
 
         const answer = (text) => ctx.answerCbQuery(text).catch(() => {});
@@ -461,6 +614,25 @@ function registerBroadcast(bot, opts) {
             drafts.delete(id);
             await ctx.editMessageReplyMarkup(undefined).catch(() => {});
             return void await answer('Cancelled.');
+        }
+
+        // Anonymity and multiple-answers are fixed at creation -- sendPoll takes them
+        // and no API call can change them afterwards -- so the only moment they can be
+        // set is before the topic button is tapped. Guarded by the same sent/sending
+        // flags as the send itself: a toggle racing a send would decide the poll's
+        // shape after the payload was already on its way.
+        if (choice === 'a' || choice === 'm') {
+            if (draft.kind !== 'poll') return void await answer('Nothing to change here.');
+            if (draft.sent) return void await answer('Already sent.');
+            if (draft.sending) return void await answer('Still sending...');
+
+            if (choice === 'a') draft.isAnonymous = !draft.isAnonymous;
+            else draft.multiple = !draft.multiple;
+
+            await ctx.editMessageText(renderPoll(draft), { reply_markup: keyboardFor(id, draft) }).catch((err) => {
+                console.warn('⚠️ Could not redraw the poll preview:', err?.response?.description || err?.message);
+            });
+            return void await answer(pollFooter(draft));
         }
 
         const target = targets[Number(choice)];
@@ -480,7 +652,22 @@ function registerBroadcast(bot, opts) {
         let sent;
         try {
             const thread = target.threadId ?? undefined;
-            if (draft.media.length > 1) {
+            if (draft.kind === 'poll') {
+                // options is an array of InputPollOption, not of strings: the Bot API
+                // changed that in 7.3 and telegraf 4.16.3 predates it, so its typings
+                // still say string[]. It passes the value straight through to a JSON
+                // body, so the objects arrive as the current API wants them.
+                sent = await telegram.sendPoll(
+                    chatId,
+                    draft.question,
+                    draft.options.map((text) => ({ text })),
+                    {
+                        is_anonymous: draft.isAnonymous,
+                        allows_multiple_answers: draft.multiple,
+                        message_thread_id: thread,
+                    },
+                );
+            } else if (draft.media.length > 1) {
                 // sendMediaGroup answers with an ARRAY of messages, one per item.
                 // The first is what the message link should point at.
                 const group = await telegram.sendMediaGroup(chatId, albumPayload(draft), { message_thread_id: thread });
@@ -517,13 +704,18 @@ function registerBroadcast(bot, opts) {
         await say(ctx, `✅ Sent to ${target.name}.${link ? `\n${link}` : ''}`);
     });
 
-    console.log(`📣 Broadcast ready. Topics: ${targets.map((t) => `${t.name}=${t.threadId ?? 'General'}`).join(', ')}`);
+    // "Bot is awake!" comes back from every version ever deployed, so HTTP cannot tell
+    // you which commit is live. This line can, which is why it names the features and
+    // not just the topics -- change it whenever they change.
+    console.log(`📣 Broadcast + polls ready. Topics: ${targets.map((t) => `${t.name}=${t.threadId ?? 'General'}`).join(', ')}`);
     return { drafts, targets, isAdmin };
 }
 
 module.exports = {
     registerBroadcast,
     parseTargets,
+    parsePoll,
+    renderPoll,
     stripLeadingPost,
     messageLink,
     makeAdminGate,
