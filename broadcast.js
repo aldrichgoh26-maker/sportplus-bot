@@ -394,44 +394,60 @@ function registerBroadcast(bot, opts) {
         return { inline_keyboard: rows };
     };
 
-    bot.command('here', async (ctx) => {
+    // EVERY command goes through this. Before it existed the gate was applied only
+    // where the danger was obvious -- /poll and the message handler -- so the bot was
+    // admin-only for the paths that PUBLISH and open to anyone for the paths that
+    // INFORM. /here handed the chat id and topic id to whoever asked, in any chat.
+    // /help and /start handed out the whole capability list. /cancel confirmed a draft
+    // system existed. None of those post anything, which is exactly why they were
+    // missed, and reconnaissance is still not something a stranger should get.
+    //
+    // The two refusals differ on purpose. A DM gets ONE neutral line: the owner chose
+    // that over silence in 2026-08, because on this host silence is genuinely
+    // ambiguous -- the bot has been down for a week at a time, and "no reply" has to
+    // keep meaning that. A group gets NOTHING, or any member could make the bot speak
+    // in a topic just by typing a command at it.
+    const adminOnly = (handler) => async (ctx) => {
+        if (await isAdmin(ctx.from?.id)) return handler(ctx);
+        if (ctx.chat?.type === 'private') await ctx.reply(NOT_FOR_YOU);
+    };
+
+    bot.command('here', adminOnly(async (ctx) => {
         const thread = ctx.message?.message_thread_id;
         await ctx.reply(
             `chat id: ${ctx.chat.id}\n` +
             `topic id: ${thread ?? '(none -- this is General, or a private chat)'}\n\n` +
             'Put these in BROADCAST_TOPICS as Name:id, comma separated.'
         );
-    });
+    }));
 
-    const help = async (ctx) => {
+    const help = adminOnly(async (ctx) => {
         if (ctx.chat?.type !== 'private') return;
         await ctx.reply(HELP);
-    };
+    });
     bot.command('help', help);
     bot.command('start', help);
 
-    bot.command('cancel', async (ctx) => {
+    bot.command('cancel', adminOnly(async (ctx) => {
         if (ctx.chat?.type !== 'private') return;
         const found = drafts.newestFrom(ctx.from.id);
         if (!found) return void await ctx.reply('Nothing to cancel.');
         drafts.delete(found.id);
         await ctx.reply('Draft dropped.');
-    });
+    }));
 
-    bot.command('poll', async (ctx) => {
+    bot.command('poll', adminOnly(async (ctx) => {
         // Drafting in the group would put the half-written version in front of the
         // people it is for, which is the whole thing the preview exists to prevent.
         // Answer anyway rather than ignoring it: an admin who types /poll in a topic
         // and gets nothing back has no way to tell that from the bot being down --
-        // and on this host that is a real possibility, not a hypothetical one. Only
-        // admins get the nudge, so a member cannot use it to make the bot talk.
+        // and on this host that is a real possibility, not a hypothetical one. The
+        // gate above already dropped non-admins in silence, so this nudge can only
+        // ever reach an admin.
         if (ctx.chat?.type !== 'private') {
-            if (await isAdmin(ctx.from.id)) {
-                await ctx.reply('Send /poll to me in a DM -- you get a preview there, and a poll cannot be edited once it is posted.');
-            }
+            await ctx.reply('Send /poll to me in a DM -- you get a preview there, and a poll cannot be edited once it is posted.');
             return;
         }
-        if (!(await isAdmin(ctx.from.id))) return void await ctx.reply(NOT_FOR_YOU);
 
         const { text } = stripLeadingPost(ctx.message?.text ?? '', [], 'poll');
         const parsed = parsePoll(text);
@@ -445,7 +461,7 @@ function registerBroadcast(bot, opts) {
             isAnonymous: true,
             multiple: false,
         });
-    });
+    }));
 
     const albums = new Map();   // media_group_id -> { items, from, chatId, timer }
 
