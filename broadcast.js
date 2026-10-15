@@ -34,8 +34,12 @@ const ADMIN_CACHE_STALE_MS = 60 * 60 * 1000;
 // Thread 0 / empty means General, which is not addressable by id: the Bot API
 // wants message_thread_id omitted entirely, so General is modelled as null and
 // never as 0.
+//
+// Our group renamed its General topic to RANDOM CHAT, and a button has to say what
+// the app says -- an admin looking for "RANDOM CHAT" will not read "General" as the
+// same room. The live label comes from BROADCAST_TOPICS; this is only the fallback.
 function parseTargets(spec) {
-    const fallback = [{ name: 'General', threadId: null }];
+    const fallback = [{ name: 'RANDOM CHAT', threadId: null }];
     if (!spec || !String(spec).trim()) return fallback;
 
     const out = [];
@@ -324,6 +328,7 @@ function makeDraftStore({ now = Date.now } = {}) {
 const HELP = [
     "Hi — I'm Spark. Send me what you want in the group and I'll show it back to you",
     'with a button for each topic -- nothing is posted until you tap one.',
+    'RANDOM CHAT asks once more before posting, because everyone in the group sees it.',
     '',
     'Works with: text, photos, videos, GIFs, files, and albums (several photos or videos',
     'sent together). Add a caption and it rides along.',
@@ -394,6 +399,19 @@ function registerBroadcast(bot, opts) {
         return { inline_keyboard: rows };
     };
 
+    // The main chat -- the no-thread target, RANDOM CHAT in our group -- is the one
+    // room every member reads, and its button sits top-left, where a thumb lands
+    // first. So a tap there swaps the topic buttons for this question instead of
+    // posting. Only the "y" button posts; a stale or repeated tap on the topic
+    // button just asks again, so nothing can skip it.
+    const confirmKeyboardFor = (id, index, target) => ({
+        inline_keyboard: [
+            [{ text: `✅ Yes, post in ${target.name}`, callback_data: `bc:${id}:y${index}` }],
+            [{ text: '↩️ No, pick another topic', callback_data: `bc:${id}:b` }],
+        ],
+    });
+    const asksFirst = (target) => target.threadId == null;
+
     // EVERY command goes through this. Before it existed the gate was applied only
     // where the danger was obvious -- /poll and the message handler -- so the bot was
     // admin-only for the paths that PUBLISH and open to anyone for the paths that
@@ -416,7 +434,7 @@ function registerBroadcast(bot, opts) {
         const thread = ctx.message?.message_thread_id;
         await ctx.reply(
             `chat id: ${ctx.chat.id}\n` +
-            `topic id: ${thread ?? '(none -- this is General, or a private chat)'}\n\n` +
+            `topic id: ${thread ?? '(none -- this is RANDOM CHAT, i.e. General, or a private chat)'}\n\n` +
             'Put these in BROADCAST_TOPICS as Name:id, comma separated.'
         );
     }));
@@ -615,7 +633,7 @@ function registerBroadcast(bot, opts) {
 
     bot.on('callback_query', async (ctx) => {
         const data = ctx.callbackQuery?.data || '';
-        const m = /^bc:([A-Za-z0-9_-]+):(\d+|x|a|m)$/.exec(data);
+        const m = /^bc:([A-Za-z0-9_-]+):(\d+|y\d+|x|a|m|b)$/.exec(data);
         if (!m) return;
 
         const answer = (text) => ctx.answerCbQuery(text).catch(() => {});
@@ -653,13 +671,38 @@ function registerBroadcast(bot, opts) {
             return void await answer(pollFooter(draft));
         }
 
-        const target = targets[Number(choice)];
+        // "No" on the main-chat question: put the topic buttons back.
+        if (choice === 'b') {
+            if (draft.sent) return void await answer('Already sent.');
+            await ctx.editMessageReplyMarkup(keyboardFor(id, draft)).catch(() => {});
+            return void await answer('Not posted. Pick a topic.');
+        }
+
+        const confirmed = choice.startsWith('y');
+        const index = Number(confirmed ? choice.slice(1) : choice);
+        const target = targets[index];
         if (!target) return void await answer('That topic is no longer configured.');
 
         // Idempotency. Telegram will happily deliver the same callback twice on a
         // double tap or a flaky connection, and the second one must not post again.
         if (draft.sent) return void await answer('Already sent.');
         if (draft.sending) return void await answer('Still sending...');
+
+        if (asksFirst(target) && !confirmed) {
+            const markup = confirmKeyboardFor(id, index, target);
+            // Asked on the preview itself where possible, so the question sits on
+            // the very message it is about. If that edit fails, ask underneath
+            // instead -- a tap that visibly does nothing reads as "it posted".
+            const asked = await ctx.editMessageReplyMarkup(markup).then(() => true, (err) => {
+                console.warn('⚠️ Could not swap in the confirm buttons:', err?.response?.description || err?.message);
+                return false;
+            });
+            if (!asked) {
+                await ctx.reply(`Post this in ${target.name}? Everyone in the group sees it there.`, { reply_markup: markup })
+                    .catch((err) => console.error('⚠️ Could not ask about the main chat:', err?.response?.description || err?.message));
+            }
+            return void await answer(`${target.name} is the main chat -- everyone sees it. Tap Yes to post there.`);
+        }
         draft.sending = true;
 
         // This try guards the SEND and nothing else. Everything after it -- the
@@ -725,7 +768,7 @@ function registerBroadcast(bot, opts) {
     // "Bot is awake!" comes back from every version ever deployed, so HTTP cannot tell
     // you which commit is live. This line can, which is why it names the features and
     // not just the topics -- change it whenever they change.
-    console.log(`📣 Broadcast + polls ready. Topics: ${targets.map((t) => `${t.name}=${t.threadId ?? 'General'}`).join(', ')}`);
+    console.log(`📣 Broadcast + polls ready, main chat asks first. Topics: ${targets.map((t) => `${t.name}=${t.threadId ?? 'General'}`).join(', ')}`);
     return { drafts, targets, isAdmin };
 }
 

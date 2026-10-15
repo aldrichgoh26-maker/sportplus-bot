@@ -28,8 +28,10 @@ let replies = [];      // ctx.reply -- what the admin sees in the DM
 let answers = [];      // ctx.answerCbQuery -- the toast on the button
 let deletions = [];    // ctx.deleteMessage -- the bouncer
 let edits = [];        // ctx.editMessageText -- redrawing a poll preview after a toggle
+let markups = [];      // ctx.editMessageReplyMarkup -- the RANDOM CHAT question swapping buttons
 let adminsError = null;
 let replyError = null;
+let markupError = null;
 let msgId = 1000;
 
 const fakeTelegram = {
@@ -111,7 +113,10 @@ class StubTelegraf {
                 return { message_id: ++msgId };
             },
             answerCbQuery: async (t) => { answers.push(t ?? ''); },
-            editMessageReplyMarkup: async () => {},
+            editMessageReplyMarkup: async (markup) => {
+                if (markupError) throw markupError;
+                markups.push(markup);
+            },
             editMessageText: async (text, extra) => { edits.push({ text, extra }); },
             deleteMessage: async () => { deletions.push(update.message?.message_id ?? '?'); },
         };
@@ -140,7 +145,7 @@ function loadBot(env = {}) {
         THREAD_ID: String(NEWS_THREAD),
         MAX_AGE_HOURS: '7.5',
         PORT: '0',
-        BROADCAST_TOPICS: 'General:0,News:286',
+        BROADCAST_TOPICS: 'RANDOM CHAT:0,News:286',
         BROADCAST_ADMIN_IDS: '',
         BROADCAST_ALBUM_SETTLE_MS: '40',   // real value is 1500; no reason to sleep it
         ...env,
@@ -188,7 +193,16 @@ const tap = (from, data) => ({
     },
 });
 
-function reset() { sends = []; replies = []; answers = []; deletions = []; edits = []; adminsError = null; replyError = null; }
+function reset() { sends = []; replies = []; answers = []; deletions = []; edits = []; markups = []; adminsError = null; replyError = null; markupError = null; }
+
+// RANDOM CHAT asks before it posts (cases 32-35). Most cases only use it as "a
+// target", so they answer the question the way an admin does: tap it, then tap Yes.
+const yesFor = (data) => data.replace(/:(\d+)$/, ':y$1');
+async function postVia(bot, from, data) {
+    await bot.dispatch(tap(from, data));
+    if (/:0$/.test(data)) await bot.dispatch(tap(from, yesFor(data)));
+}
+const markupButtons = () => (markups[markups.length - 1]?.inline_keyboard || []).flat();
 const toGroup = () => sends.filter((s) => s.chat === GROUP);
 const toDm = () => sends.filter((s) => s.chat !== GROUP);
 const preview = () => toDm()[0];
@@ -234,8 +248,8 @@ function check(name, ok, detail) {
     await bot.dispatch(dm(OWNER, 'Track session moved to 7pm'));
     const p = preview();
     check('admin DM -> preview in the DM only, group untouched',
-        toGroup().length === 0 && !!p && String(p.chat) === String(OWNER) && !!buttonFor('General'),
-        `group sends=${toGroup().length} preview chat=${p?.chat} buttons=${!!buttonFor('General')}`);
+        toGroup().length === 0 && !!p && String(p.chat) === String(OWNER) && !!buttonFor('RANDOM CHAT'),
+        `group sends=${toGroup().length} preview chat=${p?.chat} buttons=${!!buttonFor('RANDOM CHAT')}`);
 
     // 3. The tap is what publishes, into the topic the button named.
     {
@@ -259,11 +273,11 @@ function check(name, ok, detail) {
     reset();
     await bot.dispatch(dm(OWNER, 'Shop drop Friday'));
     {
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const g = toGroup();
-        check('tapping General -> posts with no thread id at all',
+        check('RANDOM CHAT (General) -> posts with no thread id at all',
             g.length === 1 && g[0].opts.message_thread_id === undefined,
             `thread=${JSON.stringify(g[0]?.opts?.message_thread_id)}`);
     }
@@ -272,7 +286,7 @@ function check(name, ok, detail) {
     reset();
     await bot.dispatch(dm(OWNER, 'Half-written thought'));
     {
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
         await bot.dispatch(tap(SECOND_ADMIN, data));
         check('a different admin tapping someone else\'s draft -> refused',
@@ -295,9 +309,9 @@ function check(name, ok, detail) {
     ]));
     {
         const shown = preview();
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const g = toGroup()[0];
         const ok = shown?.text === 'Race is Sunday'
             && g?.text === 'Race is Sunday'
@@ -324,9 +338,9 @@ function check(name, ok, detail) {
         { type: 'bold', offset: 0, length: 4 },
     ]));
     {
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const g = toGroup()[0];
         check('video -> sendVideo with caption and entities intact',
             toGroup().length === 1 && g?.kind === 'video' && g?.file === 'vid-1'
@@ -343,9 +357,9 @@ function check(name, ok, detail) {
         document: { file_id: 'gif-1-as-doc' },
     }, 'nice'));
     {
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const g = toGroup()[0];
         check('GIF -> sendAnimation, NOT sendDocument',
             toGroup().length === 1 && g?.kind === 'animation' && g?.file === 'gif-1',
@@ -362,9 +376,9 @@ function check(name, ok, detail) {
     {
         const previews = toDm().filter((s) => s.kind === 'album');
         const oneDraft = previews.length === 1 && previews[0].media.length === 3;
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const g = toGroup();
         const payload = g[0]?.media || [];
         const captionOnFirstOnly = payload[0]?.caption === 'Meet recap'
@@ -384,9 +398,9 @@ function check(name, ok, detail) {
         await bot.dispatch(second);            // arrives out of order
         await bot.dispatch(first);
         await sleep(150);
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const payload = toGroup()[0]?.media || [];
         check('album items are sorted by message_id, not arrival order',
             payload.length === 2 && payload[0].media === 'x-big' && payload[1].media === 'y-big',
@@ -400,14 +414,14 @@ function check(name, ok, detail) {
     await bot.dispatch(dmMedia(OWNER, photoField('p'), 'x', undefined, 'grp-3'));
     await bot.dispatch(dmMedia(OWNER, { animation: { file_id: 'g' }, document: { file_id: 'gd' } }, undefined, undefined, 'grp-3'));
     await sleep(150);
-    const gifAlbumRefused = toGroup().length === 0 && !buttonFor('General')
+    const gifAlbumRefused = toGroup().length === 0 && !buttonFor('RANDOM CHAT')
         && replies.concat(toDm().map((s) => s.text || '')).some((t) => /GIFs cannot go in an album/i.test(t || ''));
 
     reset();
     await bot.dispatch(dmMedia(OWNER, photoField('q'), 'x', undefined, 'grp-4'));
     await bot.dispatch(dmMedia(OWNER, { document: { file_id: 'file-1' } }, undefined, undefined, 'grp-4'));
     await sleep(150);
-    const mixedRefused = toGroup().length === 0 && !buttonFor('General')
+    const mixedRefused = toGroup().length === 0 && !buttonFor('RANDOM CHAT')
         && toDm().some((s) => /cannot be mixed/i.test(s.text || ''));
 
     check('albums Telegram would reject are refused up front, with the reason',
@@ -429,10 +443,10 @@ function check(name, ok, detail) {
     reset();
     await bot.dispatch(dm(OWNER, 'Receipt will fail'));
     {
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
         replyError = new Error('403: bot was blocked by the user');
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const landed = toGroup().length === 1;
         const toldSent = answers.some((a) => /sent to/i.test(a)) && !answers.some((a) => /failed/i.test(a));
 
@@ -464,7 +478,7 @@ function check(name, ok, detail) {
             toGroup().length === 0 && sends.every((s) => s.kind !== 'poll')
             && /Which race next\?/.test(rendered)
             && /1\. Standard Chartered/.test(rendered) && /2\. Sundown/.test(rendered)
-            && /Anonymous · one answer/.test(rendered) && !!buttonFor('General'),
+            && /Anonymous · one answer/.test(rendered) && !!buttonFor('RANDOM CHAT'),
             `groupSends=${toGroup().length} polls=${sends.filter((s) => s.kind === 'poll').length} preview=${JSON.stringify(rendered)}`);
     }
 
@@ -502,7 +516,7 @@ function check(name, ok, detail) {
         { type: 'bot_command', offset: 0, length: 5 },
     ]));
     {
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
         await bot.dispatch(tap(OWNER, data.replace(/:\d+$/, ':a')));
         await bot.dispatch(tap(OWNER, data.replace(/:\d+$/, ':m')));
@@ -512,7 +526,7 @@ function check(name, ok, detail) {
             && /Names shown · multiple answers/.test(redrawn)
             && keys.some((t) => /Names shown/.test(t)) && keys.some((t) => /Multiple answers/.test(t));
 
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const poll = toGroup()[0];
         check('toggles flip the poll and redraw the preview in step',
             toggled && toGroup().length === 1
@@ -535,9 +549,9 @@ function check(name, ok, detail) {
         { type: 'bot_command', offset: 0, length: 5 },
     ]));
     {
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const poll = toGroup()[0];
         check('single line split on "|" -> same question and options',
             poll?.question === 'Shoe day?'
@@ -552,9 +566,9 @@ function check(name, ok, detail) {
         { type: 'bot_command', offset: 0, length: 5 },
     ]));
     {
-        const data = buttonFor('General');
+        const data = buttonFor('RANDOM CHAT');
         reset();
-        await bot.dispatch(tap(OWNER, data));
+        await postVia(bot, OWNER, data);
         const poll = toGroup()[0];
         check('list markers stripped from options, question left alone',
             JSON.stringify(poll?.options) === JSON.stringify([{ text: 'Track' }, { text: 'Road' }, { text: 'Trail' }]),
@@ -698,6 +712,101 @@ function check(name, ok, detail) {
     check('bouncer stays at home: same thread id in another group is left alone',
         deletions.length === 0,
         `deletions in a foreign group=${deletions.length}`);
+
+    // --- RANDOM CHAT asks first ---------------------------------------------------
+    //
+    // ATHLO READS are meant for Inside ATHLO+, and the main-chat button sits top-left,
+    // where a thumb lands first. Every member reads RANDOM CHAT, so a post there is
+    // the one mistake the whole group sees. These fail against the old code, which
+    // posted on the first tap.
+
+    // 32. The first tap is a question, not a post.
+    reset();
+    await bot.dispatch(dm(OWNER, '📖 ATHLO READS -- meant for Inside ATHLO+'));
+    {
+        const data = buttonFor('RANDOM CHAT');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const btns = markupButtons();
+        const yes = btns.find((b) => /Yes, post in RANDOM CHAT/.test(b.text));
+        const no = btns.find((b) => /pick another topic/i.test(b.text));
+        check('tapping RANDOM CHAT -> asks first: Yes / No, nothing posted',
+            toGroup().length === 0 && btns.length === 2 && yes?.callback_data === yesFor(data)
+            && !!no && answers.some((a) => /main chat/i.test(a)),
+            `sends=${toGroup().length} buttons=${btns.map((b) => b.text).join(' | ')} toast="${answers[0] ?? ''}"`);
+
+        // 33. "No" puts every topic button back, and the right topic then posts at
+        //     once -- a threaded topic never asks.
+        reset();
+        await bot.dispatch(tap(OWNER, no?.callback_data || 'missing'));
+        const restored = markupButtons().map((b) => b.text);
+        const backOk = toGroup().length === 0
+            && ['RANDOM CHAT', 'News', 'Cancel'].every((n) => restored.some((t) => t.includes(n)));
+        reset();
+        await bot.dispatch(tap(OWNER, data.replace(/:0$/, ':1')));
+        const g = toGroup();
+        check('"No" restores the topic buttons; tapping News then posts once, unasked',
+            backOk && g.length === 1 && g[0].opts.message_thread_id === NEWS_THREAD
+            && !markups.some((m) => m?.inline_keyboard),
+            `restored=${restored.join(' | ')} sends=${g.length} thread=${g[0]?.opts?.message_thread_id}`);
+    }
+
+    // 34. Yes posts exactly once, with no thread id. After that, neither a second Yes
+    //     nor the stale topic button can post it again.
+    reset();
+    await bot.dispatch(dm(OWNER, 'GIVEAWAY RESULTS'));
+    {
+        const data = buttonFor('RANDOM CHAT');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        await bot.dispatch(tap(OWNER, yesFor(data)));
+        const g = toGroup();
+        const once = g.length === 1 && g[0].opts.message_thread_id === undefined
+            && answers.some((a) => /sent to RANDOM CHAT/i.test(a));
+        reset();
+        await bot.dispatch(tap(OWNER, yesFor(data)));
+        await bot.dispatch(tap(OWNER, data));
+        check('Yes posts once into RANDOM CHAT; a second Yes or a stale tap is refused',
+            once && toGroup().length === 0 && answers.length === 2 && answers.every((a) => /already sent/i.test(a)),
+            `firstSends=${g.length} thread=${JSON.stringify(g[0]?.opts?.message_thread_id)} later=${JSON.stringify(answers)}`);
+    }
+
+    // 35. Yes is gated like every other button: only the admin who wrote it.
+    reset();
+    await bot.dispatch(dm(OWNER, 'Owner draft'));
+    {
+        const data = buttonFor('RANDOM CHAT');
+        reset();
+        await bot.dispatch(tap(SECOND_ADMIN, yesFor(data)));
+        check('another admin cannot say Yes on someone else\'s draft',
+            toGroup().length === 0 && answers.some((a) => /who wrote this/i.test(a)),
+            `sends=${toGroup().length} answer="${answers[0] ?? ''}"`);
+    }
+
+    // 36. If the buttons cannot be swapped on the preview, the question is asked
+    //     underneath -- a tap that visibly does nothing reads as "it posted".
+    reset();
+    await bot.dispatch(dm(OWNER, 'Old preview'));
+    {
+        const data = buttonFor('RANDOM CHAT');
+        reset();
+        markupError = Object.assign(new Error('400: message can\'t be edited'), {
+            response: { error_code: 400, description: 'Bad Request: message can\'t be edited' },
+        });
+        await bot.dispatch(tap(OWNER, data));
+        check('confirm buttons cannot be swapped in -> asked in a new message, nothing posted',
+            toGroup().length === 0 && replies.some((r) => /Post this in RANDOM CHAT\?/.test(r)),
+            `sends=${toGroup().length} replies=${JSON.stringify(replies)}`);
+    }
+
+    // 37. The fallback label is the app's name for the room, not Telegram's.
+    {
+        const { parseTargets } = require(path.join(__dirname, '..', 'broadcast.js'));
+        const fb = parseTargets('');
+        check('BROADCAST_TOPICS unset -> the one button reads RANDOM CHAT, not General',
+            fb.length === 1 && fb[0].name === 'RANDOM CHAT' && fb[0].threadId === null,
+            JSON.stringify(fb));
+    }
 
     // 11. The dangerous config. THREAD_ID unset used to make the guard compare
     //     undefined to undefined, which is true for every message the bot can see

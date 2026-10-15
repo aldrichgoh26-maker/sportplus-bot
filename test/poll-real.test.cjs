@@ -25,7 +25,7 @@ Object.getPrototypeOf(bot.telegram).callApi = async function (method, payload) {
     return { message_id: 5000 + calls.length, date: 1, chat: { id: payload.chat_id } };
 };
 
-registerBroadcast(bot, { chatId: GROUP, targets: [{ name: 'News', threadId: 397 }] });
+registerBroadcast(bot, { chatId: GROUP, targets: [{ name: 'RANDOM CHAT', threadId: null }, { name: 'News', threadId: 397 }] });
 
 const dm = (text, entities) => ({
     update_id: calls.length + 1,
@@ -103,6 +103,26 @@ const check = (name, ok, detail) => {
         !calls.some((c) => c.method === 'sendPoll')
         && /at least two options/i.test(calls.find((c) => c.method === 'sendMessage')?.payload?.text || ''),
         `methods=${calls.map((c) => c.method).join(',')}`);
+
+    // 5. RANDOM CHAT asks first, through the real Context. The stubbed suite cannot
+    //    tell whether ctx.editMessageReplyMarkup really reaches editMessageReplyMarkup
+    //    with the keyboard in the right argument -- this can.
+    calls.length = 0;
+    await bot.handleUpdate(dm('📖 ATHLO READS -- meant for Inside ATHLO+'));
+    const rc = (calls.find((c) => c.method === 'sendMessage')?.payload?.reply_markup?.inline_keyboard || [])
+        .flat().find((b) => b.text.includes('RANDOM CHAT'))?.callback_data;
+    calls.length = 0;
+    await bot.handleUpdate(tap(rc));
+    const swap = calls.find((c) => c.method === 'editMessageReplyMarkup');
+    const yes = (swap?.payload?.reply_markup?.inline_keyboard || []).flat().find((b) => /^✅ Yes/.test(b.text));
+    const askedOnly = !!swap && swap.payload.message_id === 4242 && !!yes
+        && !calls.some((c) => c.payload?.chat_id === GROUP);
+    calls.length = 0;
+    await bot.handleUpdate(tap(yes?.callback_data || 'missing'));
+    const post = calls.find((c) => c.method === 'sendMessage' && c.payload.chat_id === GROUP);
+    check('RANDOM CHAT -> real editMessageReplyMarkup asks; Yes posts with no thread id',
+        askedOnly && !!post && !('message_thread_id' in JSON.parse(JSON.stringify(post.payload))),
+        `asked=${askedOnly} post=${JSON.stringify(post?.payload)}`);
 
     const failed = results.filter((r) => !r).length;
     console.log(failed ? `\n${failed} of ${results.length} FAILED` : `\nall ${results.length} passed against real telegraf`);
