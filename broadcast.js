@@ -93,6 +93,130 @@ function stripLeadingPost(text, entities, command = 'post') {
 }
 
 // ---------------------------------------------------------------------------
+// Link buttons
+// ---------------------------------------------------------------------------
+
+// The tappable button under a channel post ("🏰 Shanghai Disney 50% OFF ↗") is an
+// inline-keyboard URL button. No Telegram client can compose one -- only a bot can
+// attach it -- so the admin writes it as a line at the END of the message:
+//
+//   Button: Shop the 11.11 sale | https://athlo.sg/pages/11-11
+//
+// One line per button, one button per row. The lines are cut out of the text before
+// the preview is drawn, so the preview shows exactly what the group will get: the
+// text, and the button under it -- tappable in the DM, so the link can be tested
+// before anyone else sees it.
+//
+// Only the TAIL counts. A "Button:" line with ordinary text after it is refused
+// rather than guessed at: posting the literal line, or a button the admin did not
+// mean, is worse than one more round trip in the DM.
+
+const BUTTON_LINE = /^\s*button\s*:/i;
+const BUTTONS_MAX = 6;
+
+const BUTTON_USAGE = [
+    'Write a link button as its own line at the end of the message:',
+    '',
+    'Button: Shop the 11.11 sale | https://athlo.sg/pages/11-11',
+    '',
+    'One line per button. The text goes before the "|", the link after it.',
+].join('\n');
+
+// Telegram 400s a URL button whose link has no scheme ("Wrong HTTP URL"), and
+// "athlo.sg/pages/x" is how people actually type links. Fill in https:// for a bare
+// domain; refuse anything that still is not an http(s) or tg:// link.
+function normaliseUrl(raw) {
+    let u = String(raw ?? '').trim();
+    if (!u || /\s/.test(u)) return null;
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) {
+        if (!/^[\w-]+(\.[\w-]+)+(?:[/?#]|$)/.test(u)) return null;
+        u = `https://${u}`;
+    }
+    try {
+        const { protocol, hostname } = new URL(u);
+        if (protocol === 'tg:') return u;
+        if ((protocol === 'http:' || protocol === 'https:') && hostname.includes('.')) return u;
+    } catch { /* fall through */ }
+    return null;
+}
+
+// -> { text, entities, buttons } or { error }. Entities are clipped to the text that
+// is left, by the same UTF-16 offsets as stripLeadingPost.
+function extractButtons(text, entities) {
+    const raw = String(text ?? '');
+    const list = entities || [];
+    const lines = raw.split('\n');
+
+    const starts = [];
+    for (let i = 0, at = 0; i < lines.length; at += lines[i].length + 1, i++) starts.push(at);
+
+    let keep = lines.length;
+    while (keep > 0 && (!lines[keep - 1].trim() || BUTTON_LINE.test(lines[keep - 1]))) keep--;
+
+    if (lines.slice(0, keep).some((l) => BUTTON_LINE.test(l))) {
+        return { error: `The Button line has to be the last thing in the message.\n\n${BUTTON_USAGE}` };
+    }
+
+    const buttons = [];
+    for (let i = keep; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        const body = line.replace(BUTTON_LINE, '');
+        const bar = body.lastIndexOf('|');
+        let label;
+        let url;
+        if (bar !== -1) {
+            label = body.slice(0, bar).trim();
+            url = normaliseUrl(body.slice(bar + 1));
+        } else {
+            // "Button: Shop now" with "Shop now" hyperlinked in the client is the
+            // same instruction written the other way; take the link from the entity.
+            const from = starts[i];
+            const to = from + line.length;
+            const linked = list.find((e) => e.type === 'text_link' && e.offset < to && e.offset + e.length > from);
+            label = body.trim();
+            url = linked ? normaliseUrl(linked.url) : null;
+        }
+        if (!label || !url) {
+            return { error: `I could not read this button:\n${line.trim()}\n\n${BUTTON_USAGE}` };
+        }
+        buttons.push({ text: label, url });
+    }
+
+    if (buttons.length > BUTTONS_MAX) {
+        return { error: `That is ${buttons.length} buttons -- keep it to ${BUTTONS_MAX} or fewer.` };
+    }
+    if (!buttons.length) return { text: raw, entities: list, buttons };
+
+    const kept = raw.slice(0, keep ? starts[keep - 1] + lines[keep - 1].length : 0).replace(/\s+$/, '');
+    const clipped = [];
+    for (const e of list) {
+        if (e.offset >= kept.length) continue;
+        const length = Math.min(e.offset + e.length, kept.length) - e.offset;
+        if (length > 0) clipped.push({ ...e, length });
+    }
+    return { text: kept, entities: clipped, buttons };
+}
+
+// One button per row: a row of two halves each label, and these labels are sentences.
+// An admin who never types /help never learns Button lines exist, and the moment they
+// would want one is the moment they paste a link. So a preview whose text carries a
+// link but no button gets one line underneath, in the DM only. Once a day per admin:
+// a tip on every post becomes noise that trains people to skip Spark's replies.
+const LINK_TIP_EVERY_MS = 24 * 60 * 60 * 1000;
+const LINK_TIP = [
+    'Tip: you can put a tappable button under this post. Send it again with a last line like',
+    '',
+    'Button: Shop now | https://athlo.sg/pages/11-11',
+].join('\n');
+
+const hasLink = (text, entities) =>
+    (entities || []).some((e) => e.type === 'url' || e.type === 'text_link') || /https?:\/\//i.test(String(text ?? ''));
+
+const linkRows = (draft) => (draft?.buttons || []).map((b) => [b]);
+const linkMarkup = (draft) => (draft?.buttons?.length ? { inline_keyboard: linkRows(draft) } : undefined);
+
+// ---------------------------------------------------------------------------
 // Polls
 // ---------------------------------------------------------------------------
 
@@ -335,6 +459,11 @@ const HELP = [
     '',
     'Formatting you apply here (bold, italics, links) is carried through exactly.',
     '',
+    'Link button: end the message with a line like',
+    '  Button: Shop the 11.11 sale | https://athlo.sg/pages/11-11',
+    'and it goes out as a tappable button under the post. One line per button.',
+    'Tap it on the preview to check the link. Not possible on albums.',
+    '',
     '/poll -- start a poll. Question on the first line, one option per line after it,',
     '        or all on one line separated by "|". Anonymous and one-answer by',
     '        default; both are buttons on the preview.',
@@ -370,7 +499,9 @@ function registerBroadcast(bot, opts) {
         adminIds = String(process.env.BROADCAST_ADMIN_IDS || '').split(',').filter(Boolean),
         drafts = makeDraftStore(),
         isAdmin = makeAdminGate({ telegram, chatId, staticIds: adminIds }),
+        now = Date.now,
     } = opts;
+    const tipped = new Map();   // admin id -> when they last got the link tip
 
     if (!chatId) {
         console.warn('⚠️ Broadcast disabled: no CHANNEL_ID.');
@@ -382,7 +513,7 @@ function registerBroadcast(bot, opts) {
     // footer line in the preview text, which is edited in step with them so the two
     // can never disagree.
     const keyboardFor = (id, draft) => {
-        const rows = [];
+        const rows = linkRows(draft);
         if (draft?.kind === 'poll') {
             rows.push([
                 { text: draft.isAnonymous ? '🕶 Anonymous' : '👤 Names shown', callback_data: `bc:${id}:a` },
@@ -404,8 +535,9 @@ function registerBroadcast(bot, opts) {
     // first. So a tap there swaps the topic buttons for this question instead of
     // posting. Only the "y" button posts; a stale or repeated tap on the topic
     // button just asks again, so nothing can skip it.
-    const confirmKeyboardFor = (id, index, target) => ({
+    const confirmKeyboardFor = (id, index, target, draft) => ({
         inline_keyboard: [
+            ...linkRows(draft),
             [{ text: `✅ Yes, post in ${target.name}`, callback_data: `bc:${id}:y${index}` }],
             [{ text: '↩️ No, pick another topic', callback_data: `bc:${id}:b` }],
         ],
@@ -528,6 +660,16 @@ function registerBroadcast(bot, opts) {
             const why = err?.response?.description || err?.message;
             console.error('❌ Could not show the broadcast preview:', why);
             await telegram.sendMessage(chatId, `Could not build a preview: ${why}`).catch(() => {});
+            return;
+        }
+
+        // Not for albums -- they cannot carry a button, so the tip would be a lie.
+        if (draft.media.length <= 1 && !draft.buttons?.length && hasLink(draft.text, draft.entities)) {
+            const last = tipped.get(draft.from);
+            if (last == null || now() - last > LINK_TIP_EVERY_MS) {
+                tipped.set(draft.from, now());
+                await telegram.sendMessage(chatId, LINK_TIP).catch(() => {});
+            }
         }
     }
 
@@ -541,7 +683,11 @@ function registerBroadcast(bot, opts) {
         // group sees.
         pending.items.sort((a, b) => a.messageId - b.messageId);
 
-        const problem = albumProblem(pending.items);
+        // sendMediaGroup takes no reply_markup, so an album cannot carry a button.
+        // Refused here, before the preview, rather than silently dropped at send.
+        const problem = pending.items.some((i) => i.buttons?.length)
+            ? 'Telegram cannot put a button on an album. Send one photo or video with the Button line, or remove it.'
+            : albumProblem(pending.items);
         if (problem) {
             await telegram.sendMessage(pending.chatId, `Cannot send that album: ${problem}`).catch(() => {});
             return;
@@ -583,19 +729,25 @@ function registerBroadcast(bot, opts) {
             return;
         }
 
-        const { text, entities } = stripLeadingPost(
+        const stripped = stripLeadingPost(
             source ?? '',
             media ? msg.caption_entities : msg.entities
         );
-
         // An unrecognised command is a typo, not a broadcast. Drafting it would put
         // "/annonuce" in front of the confirm button and invite a tap.
-        if (!media && text.startsWith('/')) {
+        if (!media && stripped.text.startsWith('/')) {
             await ctx.reply('Unknown command. /help for what I can do.');
             return;
         }
+        const extracted = extractButtons(stripped.text, stripped.entities);
+        if (extracted.error) return void await ctx.reply(extracted.error);
+        const { text, entities, buttons } = extracted;
+
         if (!media && !text.trim()) {
-            await ctx.reply('That is empty -- nothing to send.');
+            // sendMessage needs text, so a button cannot go out on its own.
+            await ctx.reply(buttons.length
+                ? 'A button needs a message above it -- add some text before the Button line.'
+                : 'That is empty -- nothing to send.');
             return;
         }
 
@@ -608,7 +760,7 @@ function registerBroadcast(bot, opts) {
                 pending = { items: [], from: ctx.from.id, chatId: ctx.chat.id, timer: null };
                 albums.set(gid, pending);
             }
-            pending.items.push({ messageId: msg.message_id, media, text, entities });
+            pending.items.push({ messageId: msg.message_id, media, text, entities, buttons });
             clearTimeout(pending.timer);
             pending.timer = setTimeout(() => {
                 flushAlbum(gid).catch((err) => console.error('❌ Album preview failed:', err?.message));
@@ -620,6 +772,7 @@ function registerBroadcast(bot, opts) {
             from: ctx.from.id,
             text,
             entities,
+            buttons,
             media: media ? [media] : [],
         });
     });
@@ -648,7 +801,7 @@ function registerBroadcast(bot, opts) {
 
         if (choice === 'x') {
             drafts.delete(id);
-            await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+            await ctx.editMessageReplyMarkup(linkMarkup(draft)).catch(() => {});
             return void await answer('Cancelled.');
         }
 
@@ -689,7 +842,7 @@ function registerBroadcast(bot, opts) {
         if (draft.sending) return void await answer('Still sending...');
 
         if (asksFirst(target) && !confirmed) {
-            const markup = confirmKeyboardFor(id, index, target);
+            const markup = confirmKeyboardFor(id, index, target, draft);
             // Asked on the preview itself where possible, so the question sits on
             // the very message it is about. If that edit fails, ask underneath
             // instead -- a tap that visibly does nothing reads as "it posted".
@@ -739,11 +892,13 @@ function registerBroadcast(bot, opts) {
                     caption: draft.text || undefined,
                     caption_entities: draft.text && draft.entities.length ? draft.entities : undefined,
                     message_thread_id: thread,
+                    reply_markup: linkMarkup(draft),
                 });
             } else {
                 sent = await telegram.sendMessage(chatId, draft.text, {
                     entities: draft.entities.length ? draft.entities : undefined,
                     message_thread_id: thread,
+                    reply_markup: linkMarkup(draft),
                 });
             }
         } catch (err) {
@@ -760,7 +915,9 @@ function registerBroadcast(bot, opts) {
 
         const link = messageLink(chatId, target.threadId, sent?.message_id);
         console.log(`📣 Broadcast to ${target.name} by ${ctx.from.id} (message ${sent?.message_id})`);
-        await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+        // Only OUR buttons come off. The link buttons are part of the post, so the
+        // preview keeps them and goes on matching what the group got.
+        await ctx.editMessageReplyMarkup(linkMarkup(draft)).catch(() => {});
         await answer(`Sent to ${target.name}.`);
         await say(ctx, `✅ Sent to ${target.name}.${link ? `\n${link}` : ''}`);
     });
@@ -768,7 +925,7 @@ function registerBroadcast(bot, opts) {
     // "Bot is awake!" comes back from every version ever deployed, so HTTP cannot tell
     // you which commit is live. This line can, which is why it names the features and
     // not just the topics -- change it whenever they change.
-    console.log(`📣 Broadcast + polls ready, main chat asks first. Topics: ${targets.map((t) => `${t.name}=${t.threadId ?? 'General'}`).join(', ')}`);
+    console.log(`📣 Broadcast + polls + link buttons ready, main chat asks first. Topics: ${targets.map((t) => `${t.name}=${t.threadId ?? 'General'}`).join(', ')}`);
     return { drafts, targets, isAdmin };
 }
 
@@ -778,6 +935,8 @@ module.exports = {
     parsePoll,
     renderPoll,
     stripLeadingPost,
+    extractButtons,
+    normaliseUrl,
     messageLink,
     makeAdminGate,
     makeDraftStore,

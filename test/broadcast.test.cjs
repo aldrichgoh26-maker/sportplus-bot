@@ -808,6 +808,152 @@ function check(name, ok, detail) {
             JSON.stringify(fb));
     }
 
+    // --- link buttons --------------------------------------------------------
+
+    const SALE = 'https://athlo.sg/pages/11-11';
+    const linkButtonsOn = (opts) => (opts?.reply_markup?.inline_keyboard || []).flat().filter((b) => b.url);
+
+    // 38. A trailing Button line becomes a URL button on the preview AND the post,
+    //     and is gone from the text both times.
+    reset();
+    await bot.dispatch(dm(OWNER, `11.11 sale is live\n\nButton: Shop the sale | ${SALE}`));
+    {
+        const p = preview();
+        const pLinks = linkButtonsOn(p?.opts);
+        const data = buttonFor('News');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const g = toGroup()[0];
+        const gLinks = linkButtonsOn(g?.opts);
+        check('Button line -> URL button on preview and post, line removed from the text',
+            p?.text === '11.11 sale is live' && g?.text === '11.11 sale is live'
+            && pLinks.length === 1 && pLinks[0].text === 'Shop the sale' && pLinks[0].url === SALE
+            && JSON.stringify(g.opts.reply_markup) === JSON.stringify({ inline_keyboard: [[{ text: 'Shop the sale', url: SALE }]] }),
+            `preview=${JSON.stringify(p?.text)} post=${JSON.stringify(g?.opts?.reply_markup)}`);
+        // Our buttons come off the preview after the send; the link stays.
+        const after = markups[markups.length - 1];
+        check('after the send the preview keeps the link button and loses the topic buttons',
+            JSON.stringify(after) === JSON.stringify({ inline_keyboard: [[{ text: 'Shop the sale', url: SALE }]] }),
+            JSON.stringify(after));
+    }
+
+    // 39. Photo + caption with a button, a bare domain, and a link entity that ran
+    //     into the cut tail. RANDOM CHAT's question keeps the link visible too.
+    reset();
+    {
+        const caption = 'New drop\nButton: Shop | athlo.sg/collections/new';
+        const ents = [{ type: 'bold', offset: 0, length: 3 }, { type: 'url', offset: 24, length: 24 }];
+        await bot.dispatch(dmMedia(OWNER, photoField('p1'), caption, ents));
+        const p = preview();
+        check('photo caption Button: bare domain gets https://, tail entities dropped',
+            p?.kind === 'photo' && p.opts.caption === 'New drop'
+            && JSON.stringify(p.opts.caption_entities) === JSON.stringify([{ type: 'bold', offset: 0, length: 3 }])
+            && linkButtonsOn(p.opts)[0]?.url === 'https://athlo.sg/collections/new',
+            JSON.stringify(p?.opts));
+        const data = buttonFor('RANDOM CHAT');
+        reset();
+        await bot.dispatch(tap(OWNER, data));
+        const ask = markups[markups.length - 1];
+        check('RANDOM CHAT question still shows the link button above Yes/No',
+            ask?.inline_keyboard?.[0]?.[0]?.url === 'https://athlo.sg/collections/new' && toGroup().length === 0,
+            JSON.stringify(ask));
+        await bot.dispatch(tap(OWNER, yesFor(data)));
+        const g = toGroup()[0];
+        check('photo post carries the button',
+            g?.kind === 'photo' && linkButtonsOn(g.opts)[0]?.text === 'Shop',
+            JSON.stringify(g?.opts));
+    }
+
+    // 40. Hyperlinked label, no "|": the link comes from the entity.
+    reset();
+    {
+        const text = 'Read this\nButton: Full story';
+        await bot.dispatch(dm(OWNER, text, [{ type: 'text_link', offset: 18, length: 10, url: 'https://athlo.sg/blogs/x' }]));
+        const b = linkButtonsOn(preview()?.opts)[0];
+        check('hyperlinked "Button: Full story" -> button uses the hyperlink',
+            b?.text === 'Full story' && b?.url === 'https://athlo.sg/blogs/x' && preview()?.text === 'Read this'
+            && (preview()?.opts?.entities === undefined),
+            JSON.stringify(preview()?.opts));
+    }
+
+    // 41. Two buttons, two rows, in the order written.
+    reset();
+    await bot.dispatch(dm(OWNER, 'Two ways in\nButton: Shop | https://athlo.sg\nButton: Join | https://t.me/x'));
+    {
+        const rows = preview()?.opts?.reply_markup?.inline_keyboard || [];
+        check('two Button lines -> two rows, in order, above the topic buttons',
+            rows[0]?.[0]?.text === 'Shop' && rows[1]?.[0]?.text === 'Join' && rows[2]?.[0]?.callback_data,
+            JSON.stringify(rows));
+    }
+
+    // 42-45. Things that must be refused before any draft exists.
+    const refused = async (name, update, pattern) => {
+        reset();
+        await bot.dispatch(update);
+        check(name,
+            !preview() && toGroup().length === 0 && replies.some((r) => pattern.test(r)),
+            `previews=${preview() ? 1 : 0} replies=${JSON.stringify(replies)}`);
+    };
+    await refused('Button line with no link -> refused with the usage',
+        dm(OWNER, 'Hi\nButton: Shop now'), /could not read this button[\s\S]*Button: Shop the 11\.11 sale/i);
+    await refused('Button line followed by more text -> refused, not guessed at',
+        dm(OWNER, 'Hi\nButton: Shop | https://athlo.sg\nsee you there'), /last thing in the message/i);
+    await refused('only a Button line, no text -> refused (a button cannot go out alone)',
+        dm(OWNER, 'Button: Shop | https://athlo.sg'), /needs a message above it/i);
+    await refused('javascript: link -> refused',
+        dm(OWNER, 'Hi\nButton: Shop | javascript:alert(1)'), /could not read this button/i);
+
+    // 46. An album cannot carry buttons; say so instead of dropping the button.
+    reset();
+    await bot.dispatch(dmMedia(OWNER, photoField('a1'), `Album\nButton: Shop | ${SALE}`, [], 'g-btn'));
+    await bot.dispatch(dmMedia(OWNER, photoField('a2'), undefined, undefined, 'g-btn'));
+    await sleep(120);
+    check('album with a Button line -> refused, nothing previewed or posted',
+        toGroup().length === 0 && !buttonFor('News')
+        && sends.some((s) => /cannot put a button on an album/i.test(s.text || '')),
+        `sends=${JSON.stringify(sends.map((s) => s.text || s.kind))}`);
+
+    // 47. A message with no Button line is untouched, entities and all.
+    reset();
+    await bot.dispatch(dm(OWNER, 'Plain post', [{ type: 'italic', offset: 0, length: 5 }]));
+    check('no Button line -> text, entities and keyboard exactly as before',
+        preview()?.text === 'Plain post' && linkButtonsOn(preview()?.opts).length === 0
+        && JSON.stringify(preview()?.opts?.entities) === JSON.stringify([{ type: 'italic', offset: 0, length: 5 }]),
+        JSON.stringify(preview()?.opts));
+
+    // 48-51. The link tip. SECOND_ADMIN, so no earlier case has spent their once-a-day.
+    const tips = () => toDm().filter((s) => /^Tip: you can put a tappable button/.test(s.text || ''));
+    reset();
+    await bot.dispatch(dm(SECOND_ADMIN, 'No link in this one'));
+    const tipNoLink = tips().length;
+    reset();
+    await bot.dispatch(dm(SECOND_ADMIN, 'Has one\nButton: Shop | https://athlo.sg'));
+    const tipWithButton = tips().length;
+    check('no tip without a link, and none when the post already has a button',
+        tipNoLink === 0 && tipWithButton === 0, `noLink=${tipNoLink} withButton=${tipWithButton}`);
+
+    reset();
+    await bot.dispatch(dmMedia(SECOND_ADMIN, photoField('t1'), 'Album https://athlo.sg/a', [], 'g-tip'));
+    await bot.dispatch(dmMedia(SECOND_ADMIN, photoField('t2'), undefined, undefined, 'g-tip'));
+    await sleep(120);
+    // Before the first tip, so SECOND_ADMIN's once-a-day is unspent and this is a real check.
+    check('no tip on an album -- it cannot carry a button',
+        tips().length === 0 && !!buttonFor('News'), `tips=${tips().length}`);
+
+    reset();
+    await bot.dispatch(dm(SECOND_ADMIN, 'Details: https://athlo.sg/pages/11-11',
+        [{ type: 'url', offset: 9, length: 29 }]));
+    const order = toDm().map((s) => (s.opts?.reply_markup ? 'preview' : /^Tip/.test(s.text) ? 'tip' : 'other'));
+    check('link but no button -> the tip, in the DM, underneath the preview, nothing to the group',
+        JSON.stringify(order) === '["preview","tip"]' && toGroup().length === 0
+        && /Button: Shop now \| https:\/\//.test(tips()[0]?.text || ''),
+        JSON.stringify(order));
+
+    reset();
+    await bot.dispatch(dm(SECOND_ADMIN, 'Another https://athlo.sg/x'));
+    check('the tip is once a day per admin, not on every post',
+        tips().length === 0 && !!preview(), `tips=${tips().length}`);
+
     // 11. The dangerous config. THREAD_ID unset used to make the guard compare
     //     undefined to undefined, which is true for every message the bot can see
     //     -- and an admin bot sees all of them.

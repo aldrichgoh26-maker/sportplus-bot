@@ -124,6 +124,23 @@ const check = (name, ok, detail) => {
         askedOnly && !!post && !('message_thread_id' in JSON.parse(JSON.stringify(post.payload))),
         `asked=${askedOnly} post=${JSON.stringify(post?.payload)}`);
 
+    // 6. A link button through the real Context: the URL button must reach the
+    //    group send on the wire, and the post-send edit must leave it on the preview.
+    calls.length = 0;
+    await bot.handleUpdate(dm('11.11 is live\nButton: Shop the sale | https://athlo.sg/pages/11-11'));
+    const lp = calls.find((c) => c.method === 'sendMessage');
+    const news = (lp?.payload?.reply_markup?.inline_keyboard || []).flat().find((b) => b.text.includes('News'));
+    calls.length = 0;
+    await bot.handleUpdate(tap(news?.callback_data || 'missing'));
+    const sentPost = calls.find((c) => c.method === 'sendMessage' && c.payload.chat_id === GROUP);
+    const cleared = calls.find((c) => c.method === 'editMessageReplyMarkup');
+    const want = JSON.stringify({ inline_keyboard: [[{ text: 'Shop the sale', url: 'https://athlo.sg/pages/11-11' }]] });
+    check('link button -> on the wire to the group, and left on the preview after sending',
+        lp?.payload?.text === '11.11 is live' && !!sentPost
+        && JSON.stringify(JSON.parse(JSON.stringify(sentPost.payload)).reply_markup) === want
+        && JSON.stringify(cleared?.payload?.reply_markup) === want,
+        `post=${JSON.stringify(sentPost?.payload)} cleared=${JSON.stringify(cleared?.payload)}`);
+
     const failed = results.filter((r) => !r).length;
     console.log(failed ? `\n${failed} of ${results.length} FAILED` : `\nall ${results.length} passed against real telegraf`);
     process.exit(failed ? 1 : 0);
